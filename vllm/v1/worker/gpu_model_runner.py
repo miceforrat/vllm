@@ -51,6 +51,9 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+)
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding,
     XDRotaryEmbedding,
@@ -1707,6 +1710,37 @@ class GPUModelRunner(
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
             )
 
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        def _get_block_table_and_slot_mapping(kv_cache_gid: int):
+            assert num_reqs_padded is not None and num_tokens_padded is not None
+            kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
+            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                blk_table_tensor = torch.zeros(
+                    (num_reqs_padded, 1),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                slot_mapping = torch.zeros(
+                    (num_tokens_padded,),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            else:
+                blk_table = self.input_batch.block_table[kv_cache_gid]
+                blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)
+                slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
+
+            # Fill unused with -1. Needed for reshape_and_cache in full cuda
+            # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
+            slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
+            blk_table_tensor[num_reqs:num_reqs_padded].fill_(-1)
+
+            return blk_table_tensor, slot_mapping
+
+        block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+        if self.model_config.enable_return_routed_experts:
+            self.slot_mapping = slot_mapping_gid_0[:num_tokens].cpu().numpy()
+
         return attn_metadata, spec_decode_common_attn_metadata
 
     def _compute_cascade_attn_prefix_lens(
@@ -2833,6 +2867,13 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        
+        if self.vllm_config.model_config.enable_return_routed_experts:
+            capturer = RoutedExpertsCapturer.get_instance()
+            if capturer is not None:
+                capturer.clear_buffer()  # noqa
+            else:
+                logger.error("RoutedExpertsCapturer not initialized.")
 
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
         # and there is no draft tokens scheduled. so it need to update the
@@ -3205,6 +3246,12 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
+            if self.vllm_config.model_config.enable_return_routed_experts:
+                capturer = RoutedExpertsCapturer.get_instance()
+                if capturer is not None:
+                    capturer.clear_buffer()  # noqa
+                else:
+                    logger.error("RoutedExpertsCapturer not initialized.")
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -5285,6 +5332,29 @@ class GPUModelRunner(
                     f"{layer_impl.__class__.__name__} "
                     "does not return the softmax lse for decode."
                 )
+                
+        if self.model_config.enable_return_routed_experts:
+            self.init_routed_experts_capturer()
+
+    def init_routed_experts_capturer(self):
+        logger.info(
+            "Initializing routed experts capturer, enable_return_routed_experts: %s",
+            self.model_config.enable_return_routed_experts,
+        )
+        routed_experts_capturer = RoutedExpertsCapturer.create()
+        block_size = self.cache_config.block_size
+        self.max_num_kv_tokens = (
+            self.kv_cache_config.num_blocks // len(self.kv_cache_config.kv_cache_groups)
+            + 1
+        ) * block_size
+
+        routed_experts_capturer.init_buffer(
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_num_kv_tokens=self.max_num_kv_tokens,
+            model_config=self.model_config,
+            instance_id=self.vllm_config.instance_id,
+        )
+
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

@@ -22,6 +22,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+)
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -678,6 +681,14 @@ class FusedMoE(CustomOp):
     @property
     def shared_experts(self) -> torch.nn.Module | None:
         return None
+    
+    @property
+    def layer_id(self):
+        # Delayed import to avoid circular dependency
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        return extract_layer_index(self.layer_name)
+
 
     @property
     def gate(self) -> torch.nn.Module | None:
@@ -1651,6 +1662,19 @@ class FusedMoE(CustomOp):
             )
         else:
             zero_expert_result = None
+        
+        if (
+            self.vllm_config.model_config is not None
+            and self.vllm_config.model_config.enable_return_routed_experts
+        ):
+            # In dummy runs, the capturer is not initialized.
+            capturer = RoutedExpertsCapturer.get_instance()
+            if capturer is not None:  # in dummmy_run may be None
+                capturer.capture(  # noqa
+                    layer_id=self.layer_id,
+                    topk_ids=topk_ids,
+                )
+
         return topk_weights, topk_ids, zero_expert_result
 
     def must_reduce_shared_expert_outputs(self) -> bool:
