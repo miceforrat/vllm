@@ -75,7 +75,19 @@ profiling_tools/runners/single_process_dual_engine_matched.py
 
 `.runtime/` 和 `core` 不应提交。后两个目录/文件只有在需要保留旧双框架实验时才单独审查和提交；它们不是新机器启动单框架路径的必要条件。
 
-## 3. 新服务器的主机验收
+## 3. 当前推荐路线
+
+新服务器暂时无法访问 Docker Hub，当前先采用宿主机路径：
+
+1. 使用宿主机 CUDA 13.2 Toolkit 运行 standalone workqueue probe；
+2. probe 通过后，创建独立的用户态 Python venv；
+3. venv 中继续使用已验证的 cu130 PyTorch/vLLM 二进制栈；
+4. 不修改系统 Python，不向系统 site-packages 安装包；
+5. Docker 网络恢复后，再把同一流程迁入容器。
+
+`registry-1.docker.io:443 connect: connection refused` 表示 registry 网络、DNS、代理或防火墙问题，并不能证明镜像 tag 不存在。宿主机方案会暂时失去容器级系统依赖隔离，但足以验证 GC workqueue 和完成第一轮 matched workload。
+
+## 4. 新服务器的宿主机验收
 
 先确认驱动、GPU 和 Docker GPU runtime：
 
@@ -85,7 +97,18 @@ docker version
 docker info | grep -i runtime
 ```
 
-然后运行一个纯 CUDA 容器测试。镜像的具体 patch tag以服务器可拉取的 CUDA 13.2 devel tag 为准：
+首先确认宿主机 Toolkit：
+
+```bash
+which nvcc
+nvcc --version
+ls -ld /usr/local/cuda*
+ldconfig -p | grep -E 'libcuda|libcudart' | head -20
+```
+
+必须确认 RTX 5090 正常可见、驱动支持 CUDA 13.2、`nvcc` 为 CUDA 13.1/13.2，并且 `libcuda.so.1` 来自驱动。
+
+如果 Docker registry 恢复可达，再运行纯 CUDA 容器测试。镜像的具体 patch tag 以服务器可拉取的 CUDA 13.2 devel tag 为准：
 
 ```bash
 docker run --rm --gpus all \
@@ -93,14 +116,27 @@ docker run --rm --gpus all \
   nvidia-smi
 ```
 
-验收条件：
+Docker 验收条件：
 
 - GPU 显示 RTX 5090；
 - 驱动属于支持 CUDA 13.2 的 R595 系列或更高；
 - 容器内可以看到 GPU；
 - `/usr/local/cuda/bin/nvcc --version` 显示 CUDA 13.2。
 
-## 4. 推荐容器
+### 4.1 Docker Hub 故障诊断与离线导入
+
+```bash
+getent hosts registry-1.docker.io
+curl -Iv --connect-timeout 10 https://registry-1.docker.io/v2/
+env | grep -i proxy
+docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
+```
+
+`curl` 返回 `401 Unauthorized` 表示 registry 网络可达；`connection refused` 或 timeout 表示链路仍未打通。shell 代理不一定会被 Docker daemon 使用。
+
+离线镜像可以在联网机器用 `docker save` 导出，并在新服务器用 `docker load` 导入。
+
+## 5. Docker 路径（网络恢复后的推荐方案）
 
 为了编译 workqueue 探针，使用 `devel` 而不是 `runtime` 镜像：
 
@@ -130,35 +166,43 @@ docker run -it \
 apt-get update
 apt-get install -y git git-lfs curl build-essential ca-certificates
 git lfs install
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH=/root/.local/bin:$PATH
+
+curl -fsSLo /tmp/miniconda.sh \
+  https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash /tmp/miniconda.sh -b -p /opt/conda
+source /opt/conda/etc/profile.d/conda.sh
+
+conda create -n vllm-omni-co-cu132 python=3.13 pip -y
+conda activate vllm-omni-co-cu132
+python -m pip install uv
 ```
 
-## 5. 拉取代码
+## 6. 拉取代码
 
 ```bash
-cd /workspace
+mkdir -p /data/cjh/cosmos3-workspace
+cd /data/cjh/cosmos3-workspace
 
 git clone git@github.com:miceforrat/vllm.git vllm-single-framework
-cd /workspace/vllm-single-framework
+cd /data/cjh/cosmos3-workspace/vllm-single-framework
 git checkout experiment/omni-model-backend
 
-cd /workspace
+cd /data/cjh/cosmos3-workspace
 git clone git@github.com:miceforrat/vllm-omni.git vllm-omni
-cd /workspace/vllm-omni
+cd /data/cjh/cosmos3-workspace/vllm-omni
 git checkout experiment/cosmos3-dual-framework
 ```
 
 固定并记录实际提交：
 
 ```bash
-git -C /workspace/vllm-single-framework rev-parse HEAD
-git -C /workspace/vllm-omni rev-parse HEAD
-git -C /workspace/vllm-single-framework status --short
-git -C /workspace/vllm-omni status --short
+git -C /data/cjh/cosmos3-workspace/vllm-single-framework rev-parse HEAD
+git -C /data/cjh/cosmos3-workspace/vllm-omni rev-parse HEAD
+git -C /data/cjh/cosmos3-workspace/vllm-single-framework status --short
+git -C /data/cjh/cosmos3-workspace/vllm-omni status --short
 ```
 
-## 6. 重建已验证 Python 栈
+## 7. 使用 Conda 重建隔离的 Python 栈
 
 旧环境的已知版本为：
 
@@ -173,27 +217,61 @@ triton       3.7.1
 flashinfer   0.7.0.post1
 ```
 
-推荐先重建同一套 cu130 Python 栈。新 CUDA 13.2 驱动提供向后兼容；不要把系统 `/usr/local/cuda-13.2/lib64` 强行放到 `LD_LIBRARY_PATH` 前面覆盖 wheel 自带依赖。
+推荐继续使用 cu130 Python 栈。CUDA 13.2 驱动向后兼容 cu130 用户态二进制；不要把 `/usr/local/cuda-13.2/lib64` 强行放到 `LD_LIBRARY_PATH` 前面覆盖 wheel 自带依赖。
+
+先确认 Conda：
 
 ```bash
-mkdir -p /workspace/runtime
-uv venv --python 3.13 /workspace/runtime/vllm-omni/venv
-source /workspace/runtime/vllm-omni/venv/bin/activate
+conda --version
+```
 
+如果宿主机没有 Conda，可以无 root 安装 Miniconda：
+
+```bash
+curl -fsSLo /tmp/miniconda.sh \
+  https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash /tmp/miniconda.sh -b -p "$HOME/miniconda3"
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda --version
+```
+
+如果当前 shell 尚未初始化 Conda：
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+```
+
+创建固定名称的环境：
+
+```bash
+conda create -n vllm-omni-co-cu132 python=3.13 pip -y
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate vllm-omni-co-cu132
+
+python -m pip install --upgrade pip
+python -m pip install uv
+```
+
+Conda 负责环境隔离；环境内使用 `uv pip` 是为了明确选择 cu130 PyTorch backend：
+
+```bash
 export UV_HTTP_TIMEOUT=600
 export UV_HTTP_RETRIES=20
 
-uv pip install --torch-backend=cu130 \
-  'vllm==0.31.0' \
-  'transformers==5.17.0'
+uv pip install --python "$(which python)" --torch-backend=cu130 \
+  "vllm==0.31.0" \
+  "transformers==5.17.0"
 
-uv pip install --no-deps -e /workspace/vllm-omni
+uv pip install --python "$(which python)" --no-deps \
+  -e /data/cjh/cosmos3-workspace/vllm-omni
 ```
 
-如果 Omni import 报缺少包，以旧环境的 freeze 文件补齐依赖，而不要随意升级核心版本。环境建好后记录：
+不要复制旧 `.venv`，不要使用 Conda base 环境，也不要执行 `sudo pip install`。如果 Omni import 报缺包，根据旧环境的 freeze 补齐依赖，不要升级核心版本。
+
+验证并记录环境：
 
 ```bash
-python - <<'PY'
+python - <<"PY"
 import importlib.metadata as m
 import torch
 
@@ -208,15 +286,18 @@ print("device:", torch.cuda.get_device_name(0))
 print("capability:", torch.cuda.get_device_capability(0))
 PY
 
-uv pip freeze > /workspace/runtime/vllm-omni/freeze.txt
+mkdir -p /data/cjh/runtime/vllm-omni-co-cu132
+python -m pip freeze > /data/cjh/runtime/vllm-omni-co-cu132/freeze.txt
+conda env export --no-builds > /data/cjh/runtime/vllm-omni-co-cu132/environment.yml
 ```
 
-## 7. 通用运行环境
+## 8. 通用运行环境
 
 ```bash
-source /workspace/runtime/vllm-omni/venv/bin/activate
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate vllm-omni-co-cu132
 
-export PYTHONPATH=/workspace/vllm-single-framework:/workspace/vllm-omni
+export PYTHONPATH=/data/cjh/cosmos3-workspace/vllm-single-framework:/data/cjh/cosmos3-workspace/vllm-omni
 export CUDA_VISIBLE_DEVICES=0
 export LD_LIBRARY_PATH=''
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
@@ -233,12 +314,12 @@ export CUDA_SCALE_LAUNCH_QUEUES=4x
 
 `CUDA_SCALE_LAUNCH_QUEUES=4x` 是此前实验中的调优项，不是 correctness 要求。首次迁移验证也应补跑 unset/default 对照。
 
-## 8. Gate 0：优先验证 GC workqueue
+## 9. Gate 0：优先验证 GC workqueue
 
 这一步不加载模型，只验证新驱动是否真正接受 workqueue resource type，以及两个 Green Context 能否各自建立 balanced workqueue。
 
 ```bash
-cd /workspace/vllm-single-framework
+cd /data/cjh/cosmos3-workspace/vllm-single-framework
 
 nvcc \
   -std=c++17 \
@@ -248,7 +329,7 @@ nvcc \
   -o /tmp/cuda_green_context_workqueue_probe
 
 /tmp/cuda_green_context_workqueue_probe \
-  | tee /workspace/workqueue_probe_cuda132.log
+  | tee /data/cjh/workqueue_probe_cuda132.log
 ```
 
 预期结果：
@@ -269,10 +350,10 @@ ldd /tmp/cuda_green_context_workqueue_probe | grep -E 'cuda|cudart'
 
 这可以区分“Toolkit 有头文件”与“实际加载的驱动不支持该 resource type”。
 
-## 9. Gate 1：最小模型加载
+## 10. Gate 1：最小模型加载
 
 ```bash
-cd /workspace/vllm-single-framework
+cd /data/cjh/cosmos3-workspace/vllm-single-framework
 
 python -u examples/offline_inference/omni_runner_config_gate.py \
   --model nvidia/Cosmos3-Edge \
@@ -287,7 +368,7 @@ python -u examples/offline_inference/omni_runner_config_gate.py \
 - 无第二个 Python worker 进程；
 - 模型加载后显存与旧服务器同量级。
 
-## 10. Gate 2：单进程双模型串行
+## 11. Gate 2：单进程双模型串行
 
 先使用小负载排除迁移错误：
 
@@ -307,7 +388,7 @@ python -u examples/offline_inference/omni_runner_dual_model_gate.py \
 
 随后再换成固定 Reasoner 输入和此前 matched T2V manifest。当前脚本仍引用旧 Cosmos workspace 里的 workload 文件，因此迁移前应把这两个小型 JSON 复制到 `vllm-single-framework/examples/offline_inference/workloads/`，消除对整个 cosmos-framework 输出目录的依赖。
 
-## 11. Gate 3：把 workqueue 接入 GC runtime
+## 12. Gate 3：把 workqueue 接入 GC runtime
 
 只有 Gate 0、1、2 都通过后才做这一项。
 
@@ -339,7 +420,7 @@ C. full-SM 串行基线
 - concurrent host wall；
 - Nsys 中的 GPU kernel overlap 与 stream/context 归属。
 
-## 12. 迁移前需要提交的最小白名单
+## 13. 迁移前需要提交的最小白名单
 
 在旧机器上由用户执行：
 
@@ -363,7 +444,7 @@ git diff --cached --stat
 
 `outputs/` 保留在本机或单独 rsync，不进入 Git。
 
-## 13. 最小成功标准
+## 14. 最小成功标准
 
 迁移完成不等于“容器启动成功”。本阶段的验收标准是：
 
