@@ -1,0 +1,24 @@
+{
+  "reasoner": {
+    "raw_prompt_sha256": "587efae1c2d3fc7c039fc436a707a1921e1c11386b7665d0d0a50105448b5724",
+    "prompt_token_count": 288,
+    "prompt_token_ids_sha256": "d44adce7cc1a357324c05b9aed8a1941c9c825a1db14f7ba17a4ed97d28fcc8c",
+    "fixed_completion_tokens": 1350
+  },
+  "generator": {
+    "canonical_workload": {
+      "prompt": "{\"temporal_caption\":\"0:00: A red robot with articulated arms approaches a silver bicycle lying on its side in a bright workshop, its metallic joints glinting under overhead fluorescent lights. 0:01: The robot's arms extend, gripping the bike's handlebars, and begin to realign the frame, adjusting the chain and brake cables. 0:02: The camera, positioned at a low angle, begins a smooth arc around the robot, revealing the workshop's concrete floor, toolboxes, and hanging cables. 0:03: The robot continues to tighten a bolt on the wheel hub, the red paint on its chassis shifting slightly as it moves. 0:04: A bright shaft of light sweeps across the scene, highlighting the robot's glowing sensor array as it rotates the front wheel. 0:05: The camera completes its arc, settling on a frontal view as the robot finishes the repair, the bicycle now upright and ready for testing.\",\"resolution\":{\"H\":480,\"W\":832},\"aspect_ratio\":\"16,9\",\"duration\":\"5s\",\"fps\":24}",
+      "negative_prompt": "",
+      "height": 480,
+      "width": 832,
+      "num_frames": 121,
+      "num_inference_steps": 35,
+      "guidance_scale": 6.0,
+      "flow_shift": 10.0,
+      "seed": 0
+    },
+    "prompt_sha256": "8498d534a21c4679407226fc5d0efd1fbdf85d834f14833fee3cbe947d714aa2",
+    "negative_prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "canonical_workload_sha256_source_note": "Copied from the matched workload; negative_prompt intentionally cleared to match the historical dual-framework Gate 1 workload."
+  }
+}

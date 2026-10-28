@@ -85,6 +85,13 @@ def use_memory_pool_with_allocator(
         yield mem_pool, new_alloc
 
 
+@contextmanager
+def _reuse_memory_pool(data):
+    """Re-enter a previously created tagged MemPool."""
+    with torch.cuda.memory.use_mem_pool(data[0]):
+        yield data
+
+
 class CuMemAllocator:
     """A singleton class that manages a memory pool for CUDA tensors.
     The memory in this pool can be offloaded or discarded when the
@@ -358,6 +365,38 @@ class CuMemAllocator:
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
                         data.cpu_backup_tensor = None
+
+    @contextmanager
+    def reuse_memory_pool(self, tag: str):
+        """Re-enter an existing tagged pool without changing create semantics.
+
+        This opt-in API is intended for runtime caches that allocate persistent
+        state incrementally. ``use_memory_pool`` remains the one-shot pool
+        creation API used by existing model and KV-cache initialization paths.
+        """
+        if not isinstance(tag, str):
+            raise TypeError("memory-pool tag must be a string")
+        data = self.allocator_and_pools.get(tag)
+        if data is None:
+            raise KeyError(f"No existing memory pool for tag {tag!r}")
+
+        prev_conf = current_alloc_conf()
+        expandable_was_enabled = conf_flag_enabled(prev_conf, EXPANDABLE_SEGMENTS)
+        if expandable_was_enabled:
+            set_alloc_conf(with_conf_flag(prev_conf, EXPANDABLE_SEGMENTS, False))
+
+        old_tag = self.current_tag
+        self.current_tag = tag
+        try:
+            # Do not unmap cached free blocks here. Unlike the one-shot
+            # creation API, this MemPool remains live and must be able to
+            # reuse its arena on the next entry.
+            with _reuse_memory_pool(data):
+                yield
+        finally:
+            self.current_tag = old_tag
+            if expandable_was_enabled:
+                set_alloc_conf(prev_conf)
 
     @contextmanager
     def use_memory_pool(self, tag: str | None = None):
