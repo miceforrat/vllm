@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+import gc
 import os
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Mapping
 
 import torch
@@ -150,6 +151,7 @@ class EmbeddedOmniDiffusionRunner:
         device: str = "cuda:0",
         use_vllm_memory_pool: bool = True,
         execution_stream: torch.cuda.Stream | None = None,
+        memory_pool_tag_prefix: str | None = None,
     ):
         self.resolved = resolved
         self.device = torch.device(device)
@@ -157,6 +159,7 @@ class EmbeddedOmniDiffusionRunner:
         self.runner: Any | None = None
         self.use_vllm_memory_pool = use_vllm_memory_pool
         self.memory_allocator: Any | None = None
+        self.memory_pool_tag_prefix = memory_pool_tag_prefix
         self.execution_stream = execution_stream
         self._owns_execution_stream = False
         self._green_context_owner: Any | None = None
@@ -165,18 +168,51 @@ class EmbeddedOmniDiffusionRunner:
         self._exit_stack = ExitStack()
         self._omni_state: Any | None = None
         self._saved_omni_groups: dict[str, Any] = {}
+        self._worker_hosted = False
+        self._parallel_topology: dict[str, Any] | None = None
+        self._auxiliary_tp_group: Any | None = None
 
     @contextmanager
     def _memory_pool_context(self, tag: str) -> Any:
         """Create a tagged pool once, then explicitly reuse it."""
         if self.memory_allocator is None:
             raise RuntimeError("vLLM memory allocator is not initialized")
-        if tag in self._memory_pool_tags:
-            context = self.memory_allocator.reuse_memory_pool(tag)
+        pool_tag = (
+            tag if self.memory_pool_tag_prefix is None
+            else f"{self.memory_pool_tag_prefix}:{tag}"
+        )
+        if pool_tag in self._memory_pool_tags:
+            context = self.memory_allocator.reuse_memory_pool(pool_tag)
         else:
-            context = self.memory_allocator.use_memory_pool(tag=tag)
+            context = self.memory_allocator.use_memory_pool(tag=pool_tag)
         with context:
-            self._memory_pool_tags.add(tag)
+            self._memory_pool_tags.add(pool_tag)
+            yield
+
+    @contextmanager
+    def _execution_context(self) -> Any:
+        if not self._worker_hosted:
+            yield
+            return
+        if self.vllm_config is None:
+            raise RuntimeError("Worker-hosted runner has no diffusion config")
+
+        from vllm.config import set_current_vllm_config
+        from vllm.distributed.parallel_state import (
+            use_tensor_model_parallel_group,
+        )
+        from vllm_omni.diffusion.forward_context import set_forward_context
+
+        if self._auxiliary_tp_group is None:
+            raise RuntimeError("Worker-hosted runner has no auxiliary TP group")
+        with (
+            use_tensor_model_parallel_group(self._auxiliary_tp_group),
+            set_current_vllm_config(self.vllm_config),
+            set_forward_context(
+                vllm_config=self.vllm_config,
+                omni_diffusion_config=self.resolved.diffusion_config,
+            ),
+        ):
             yield
 
     def memory_pool_usage(self) -> int | None:
@@ -184,6 +220,19 @@ class EmbeddedOmniDiffusionRunner:
         if self.memory_allocator is None:
             return None
         return int(self.memory_allocator.get_current_usage())
+
+    def synchronize_execution_stream(self) -> None:
+        """Wait for this runner's GPU work without synchronizing other streams."""
+        stream = self.execution_stream
+        if stream is None:
+            torch.cuda.synchronize(self.device)
+        else:
+            stream.synchronize()
+
+    def parallel_topology_stats(self) -> dict[str, Any] | None:
+        if self._parallel_topology is None:
+            return None
+        return dict(self._parallel_topology)
 
     @staticmethod
     def _stream_handle(stream: torch.cuda.Stream | None) -> int | None:
@@ -255,26 +304,57 @@ class EmbeddedOmniDiffusionRunner:
             ),
         }
 
+    @staticmethod
+    def _restore_diffusion_request(request: Any) -> Any:
+        """Restore dataclasses flattened by EngineCore utility RPC transport."""
+        if not isinstance(request, dict):
+            return request
+
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        data = dict(request)
+        sampling = data.get("sampling_params")
+        if isinstance(sampling, dict):
+            sampling_fields = {
+                field.name for field in fields(OmniDiffusionSamplingParams)
+                if field.init
+            }
+            data["sampling_params"] = OmniDiffusionSamplingParams(
+                **{key: value for key, value in sampling.items()
+                   if key in sampling_fields}
+            )
+
+        request_fields = {
+            field.name for field in fields(OmniDiffusionRequest) if field.init
+        }
+        return OmniDiffusionRequest(
+            **{key: value for key, value in data.items()
+               if key in request_fields}
+        )
+
     def execute_model(self, request: Any, **kwargs: Any) -> Any:
         """Execute Omni on the installed stream while preserving dependencies."""
         if self.runner is None:
             raise RuntimeError("Embedded Omni runner is not started")
-        stream = self.execution_stream
-        if stream is None:
-            current = torch.cuda.current_stream(self.device)
-            self._last_execution_stream_handle = self._stream_handle(current)
-            return self.runner.execute_model(request, **kwargs)
+        request = self._restore_diffusion_request(request)
+        with self._execution_context():
+            stream = self.execution_stream
+            if stream is None:
+                current = torch.cuda.current_stream(self.device)
+                self._last_execution_stream_handle = self._stream_handle(current)
+                return self.runner.execute_model(request, **kwargs)
 
-        caller = torch.cuda.current_stream(self.device)
-        stream.wait_stream(caller)
-        with torch.cuda.stream(stream):
-            actual = torch.cuda.current_stream(self.device)
-            self._last_execution_stream_handle = self._stream_handle(actual)
-            output = self.runner.execute_model(request, **kwargs)
-            completion = torch.cuda.Event()
-            completion.record(stream)
-        caller.wait_event(completion)
-        return output
+            caller = torch.cuda.current_stream(self.device)
+            stream.wait_stream(caller)
+            with torch.cuda.stream(stream):
+                actual = torch.cuda.current_stream(self.device)
+                self._last_execution_stream_handle = self._stream_handle(actual)
+                output = self.runner.execute_model(request, **kwargs)
+                completion = torch.cuda.Event()
+                completion.record(stream)
+            caller.wait_event(completion)
+            return output
 
     def execute_model_profiled(
         self, request: Any, **kwargs: Any
@@ -353,15 +433,19 @@ class EmbeddedOmniDiffusionRunner:
         names = ("_WORLD", "_SP", "_PP", "_CFG", "_DP", "_FS")
         names += ("_HSDP_REPLICATE", "_EXPERT_PARALLEL_GROUP_RANKS")
         self._saved_omni_groups = {name: getattr(omni_state, name) for name in names}
-        singleton = _SingleRankGroupView(tp)
+        # With homogeneous TP, vLLM PP is a per-rank singleton group.  Use
+        # that coordinator as the backing process group for every disabled
+        # Omni dimension; wrapping TP here would report size one while still
+        # exposing a multi-rank device_group.
+        singleton = _SingleRankGroupView(pp)
         omni_state._WORLD = world
         omni_state._SP = singleton
-        omni_state._PP = _SingleRankGroupView(pp)
+        omni_state._PP = singleton
         omni_state._CFG = singleton
         omni_state._DP = singleton
         omni_state._FS = singleton
         omni_state._HSDP_REPLICATE = singleton
-        omni_state._EXPERT_PARALLEL_GROUP_RANKS = [[0]]
+        omni_state._EXPERT_PARALLEL_GROUP_RANKS = [list(tp.ranks)]
 
     def _restore_omni_group_views(self) -> None:
         if self._omni_state is not None:
@@ -439,10 +523,121 @@ class EmbeddedOmniDiffusionRunner:
         )
         return self.runner
 
+    def start_on_worker(
+        self,
+        worker: Any,
+        *,
+        tp_group: Any,
+        load_format: str = "default",
+    ) -> Any:
+        """Start the Omni runner on an already initialized vLLM GPU worker."""
+        from vllm.device_allocator import get_mem_allocator_instance
+        from vllm.distributed.parallel_state import (
+            get_pp_group,
+            get_tp_group,
+            get_world_group,
+        )
+        from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
+        from vllm_omni.diffusion.worker.diffusion_model_runner import (
+            DiffusionModelRunner,
+        )
+        from vllm_omni.platforms import current_omni_platform
+
+        if self.runner is not None:
+            raise RuntimeError("Embedded Omni runner is already started")
+        if not hasattr(worker, "device") or not hasattr(worker, "vllm_config"):
+            raise TypeError("The runner host must be an initialized vLLM GPU worker")
+        if torch.device(worker.device) != self.device:
+            raise ValueError(
+                f"Worker device {worker.device} does not match runner device "
+                f"{self.device}"
+            )
+
+        torch.cuda.set_device(self.device)
+        world = get_world_group()
+        tp = get_tp_group()
+        pp = get_pp_group()
+        if list(tp_group.ranks) != list(tp.ranks):
+            raise ValueError(
+                "Worker-provided TP group does not match the planned topology: "
+                f"provided={tp_group.ranks}, default_tp={tp.ranks}"
+            )
+        self._auxiliary_tp_group = tp_group
+        od_config = self.resolved.diffusion_config
+        parallel = od_config.parallel_config
+        unsupported = {
+            "pipeline_parallel_size": parallel.pipeline_parallel_size,
+            "sequence_parallel_size": parallel.sequence_parallel_size,
+            "cfg_parallel_size": parallel.cfg_parallel_size,
+            "vae_patch_parallel_size": parallel.vae_patch_parallel_size,
+        }
+        unsupported = {
+            name: value for name, value in unsupported.items() if value != 1
+        }
+        if parallel.use_hsdp:
+            unsupported["use_hsdp"] = True
+        if parallel.enable_expert_parallel:
+            unsupported["enable_expert_parallel"] = True
+        if unsupported:
+            raise ValueError(
+                "The homogeneous TP gate requires all other Omni parallel "
+                f"dimensions to be disabled, got {unsupported}"
+            )
+        if list(world.ranks) != list(tp.ranks):
+            raise ValueError(
+                "The homogeneous TP gate requires one TP group spanning WORLD; "
+                f"world={world.ranks}, tp={tp.ranks}"
+            )
+        parallel.tensor_parallel_size = int(tp.world_size)
+        parallel.data_parallel_size = None
+        parallel.resolve_data_parallel_size(int(world.world_size))
+        od_config.num_gpus = int(world.world_size)
+        self._parallel_topology = {
+            "world_ranks": list(world.ranks),
+            "world_rank": int(world.rank_in_group),
+            "tp_ranks": list(tp.ranks),
+            "tp_rank": int(tp.rank_in_group),
+            "tp_size": int(tp.world_size),
+            "pp_size": 1,
+            "sp_size": 1,
+            "cfg_size": 1,
+            "dp_size": 1,
+            "hsdp_enabled": False,
+            "communicator_isolated": True,
+            "auxiliary_tp_group": self._auxiliary_tp_group.unique_name,
+        }
+        self.vllm_config = create_diffusion_vllm_config(self.device, od_config)
+        current_omni_platform.init_diffusion_worker_vllm_config(self.vllm_config)
+        self._worker_hosted = True
+        self._install_omni_group_views(
+            world=self._auxiliary_tp_group,
+            tp=self._auxiliary_tp_group,
+            pp=pp,
+        )
+        self.runner = DiffusionModelRunner(
+            vllm_config=self.vllm_config,
+            od_config=od_config,
+            device=self.device,
+        )
+        memory_pool_context_fn = None
+        if self.use_vllm_memory_pool:
+            self.memory_allocator = get_mem_allocator_instance()
+            memory_pool_context_fn = self._memory_pool_context
+        with self._execution_context():
+            self.runner.load_model(
+                memory_pool_context_fn=memory_pool_context_fn,
+                load_format=load_format,
+            )
+        return self.runner
+
     def close(self) -> None:
         if self.execution_stream is not None:
             self.execution_stream.synchronize()
         self.runner = None
+        # Pipelines contain module/hook cycles.  Collect them before restoring
+        # Omni's module-level group views so destructors cannot observe the
+        # previous runtime's topology.
+        gc.collect()
         if self._green_context_owner is not None:
             self._green_context_owner.close()
             self._green_context_owner = None
@@ -450,6 +645,9 @@ class EmbeddedOmniDiffusionRunner:
         self._restore_omni_group_views()
         self._saved_omni_groups.clear()
         self._omni_state = None
+        self._parallel_topology = None
+        # The Worker communication-group registry owns and destroys this group.
+        self._auxiliary_tp_group = None
         self._exit_stack.close()
 
     def __enter__(self) -> EmbeddedOmniDiffusionRunner:

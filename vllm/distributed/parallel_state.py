@@ -30,6 +30,7 @@ import weakref
 from collections import deque, namedtuple
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from math import gcd
@@ -1542,9 +1543,47 @@ def _replace_active_groups(
 
 
 _TP: GroupCoordinator | None = None
+_TP_CONTEXT_OVERRIDE: ContextVar[GroupCoordinator | None] = ContextVar(
+    "vllm_tp_context_override", default=None
+)
+_TP_COMPILE_OVERRIDE: GroupCoordinator | None = None
+
+
+@contextmanager
+def use_tensor_model_parallel_group(group: GroupCoordinator):
+    """Override TP for one execution context without replacing vLLM topology.
+
+    Eager code uses a ContextVar so concurrent host threads can select different
+    communicators. Dynamo cannot trace ContextVar access, so compilation uses a
+    short-lived static override. The caller must keep compilation for this model
+    inside this context.
+    """
+    global _TP_COMPILE_OVERRIDE
+    previous_compile_override = _TP_COMPILE_OVERRIDE
+    _TP_COMPILE_OVERRIDE = group
+    token = _TP_CONTEXT_OVERRIDE.set(group)
+    try:
+        yield group
+    finally:
+        _TP_CONTEXT_OVERRIDE.reset(token)
+        _TP_COMPILE_OVERRIDE = previous_compile_override
 
 
 def get_tp_group() -> GroupCoordinator:
+    # Keep the original static-global shape while Dynamo/AOT is tracing. In
+    # particular, never expose ContextVar.get() to Dynamo. Generator compile
+    # runs under use_tensor_model_parallel_group(), which supplies its private
+    # communicator through the static compile override.
+    if torch.compiler.is_compiling():
+        group = _TP_COMPILE_OVERRIDE
+        if group is not None:
+            return group
+        assert _TP is not None, "tensor model parallel group is not initialized"
+        return _TP
+
+    override = _TP_CONTEXT_OVERRIDE.get()
+    if override is not None:
+        return override
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 

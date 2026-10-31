@@ -1,0 +1,7 @@
+{
+  "model_mode": "reasoner",
+  "name": "upsample_reasoner",
+  "prompt": "You are a prompt upsampler for a text-to-video model.\nWrite temporal_caption first. Then generate planning_notes, exactly six timestamped motion_plan entries, exactly six timestamped camera_plan entries, exactly eight concise continuity_constraints. Make every entry specific and non-redundant. Write a concrete 100-180 word temporal_caption using timestamped beats from\n0:00 through 0:05. Describe subject motion, physical state changes, camera motion,\ncomposition, lighting, materials, background, and atmosphere. Preserve the requested\nsubject/action and avoid conflicting objects. Return exactly one valid JSON object\nwith exactly the requested keys and no prose or fences:\n{\"temporal_caption\": \"timestamped caption\", \"planning_notes\": \"detailed scene and physics plan\", \"motion_plan\": [{\"time\": \"0:00\", \"description\": \"motion beat\"}], \"camera_plan\": [{\"time\": \"0:00\", \"description\": \"camera beat\"}], \"continuity_constraints\": [\"constraint\"]}\n\nInput: A red robot repairs a bicycle in a bright workshop while the camera slowly moves around them.\nOutput parameters: duration 5s, fps 24, resolution 480,\naspect_ratio 16,9.\n",
+  "max_new_tokens": 1350,
+  "do_sample": false
+}
