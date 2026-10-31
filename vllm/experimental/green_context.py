@@ -177,9 +177,29 @@ class GreenContextPair:
         ignore_sm_coscheduling: bool = False,
         balanced_workqueues: bool = False,
         workqueue_concurrency_limit: int = 1,
+        first_workqueue_concurrency_limit: int | None = None,
+        second_workqueue_concurrency_limit: int | None = None,
     ) -> None:
         if workqueue_concurrency_limit <= 0:
             raise ValueError("workqueue_concurrency_limit must be positive")
+        first_workqueue_concurrency_limit = (
+            workqueue_concurrency_limit
+            if first_workqueue_concurrency_limit is None
+            else first_workqueue_concurrency_limit
+        )
+        second_workqueue_concurrency_limit = (
+            workqueue_concurrency_limit
+            if second_workqueue_concurrency_limit is None
+            else second_workqueue_concurrency_limit
+        )
+        if first_workqueue_concurrency_limit <= 0:
+            raise ValueError(
+                "first_workqueue_concurrency_limit must be positive"
+            )
+        if second_workqueue_concurrency_limit <= 0:
+            raise ValueError(
+                "second_workqueue_concurrency_limit must be positive"
+            )
         self._cuda = ctypes.CDLL(ctypes.util.find_library("cuda") or "libcuda.so.1")
         GreenContextStream._configure_signatures(self)
         if balanced_workqueues:
@@ -242,7 +262,14 @@ class GreenContextPair:
         self._streams: list[ctypes.c_void_p] = []
         self._workqueue_configs: list[dict[str, int]] = []
         try:
-            for resource in (first_resource, second_resource):
+            for resource, concurrency_limit in zip(
+                (first_resource, second_resource),
+                (
+                    first_workqueue_concurrency_limit,
+                    second_workqueue_concurrency_limit,
+                ),
+                strict=True,
+            ):
                 descriptor = ctypes.c_void_p()
                 descriptor_resources = (_DevResource * (2 if balanced_workqueues else 1))()
                 ctypes.memmove(
@@ -252,7 +279,7 @@ class GreenContextPair:
                 )
                 if balanced_workqueues:
                     descriptor_resources[1].set_balanced_workqueue_config(
-                        cuda_device.value, workqueue_concurrency_limit
+                        cuda_device.value, concurrency_limit
                     )
                 GreenContextStream._check(
                     self,
@@ -313,6 +340,12 @@ class GreenContextPair:
         self.balanced_workqueues = balanced_workqueues
         self.workqueue_concurrency_limit = (
             workqueue_concurrency_limit if balanced_workqueues else None
+        )
+        self.first_workqueue_concurrency_limit = (
+            first_workqueue_concurrency_limit if balanced_workqueues else None
+        )
+        self.second_workqueue_concurrency_limit = (
+            second_workqueue_concurrency_limit if balanced_workqueues else None
         )
 
     @property
