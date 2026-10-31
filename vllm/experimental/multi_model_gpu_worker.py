@@ -39,10 +39,26 @@ class MultiModelGPUWorker(GPUWorker):
         )
 
         requested = int(green_context["generator_sm_count"])
+        workqueue = green_context.get("workqueue", {})
+        if not isinstance(workqueue, dict):
+            raise TypeError("green_context.workqueue must be a mapping")
+        workqueue_mode = str(workqueue.get("mode", "shared"))
+        if workqueue_mode not in {"shared", "balanced"}:
+            raise ValueError(
+                "green_context.workqueue.mode must be shared or balanced"
+            )
+        workqueue_concurrency_limit = int(
+            workqueue.get("concurrency_limit", 1)
+        )
         device_index = self.device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
-        pair = GreenContextPair(requested, device_index)
+        pair = GreenContextPair(
+            requested,
+            device_index,
+            balanced_workqueues=workqueue_mode == "balanced",
+            workqueue_concurrency_limit=workqueue_concurrency_limit,
+        )
         self._multi_model_gc_pair = pair
         self._multi_model_generator_stream = torch.cuda.ExternalStream(
             pair.first_stream_ptr, device=device_index
@@ -106,6 +122,13 @@ class MultiModelGPUWorker(GPUWorker):
             "actual_generator_sm_count": pair.first_sm_count,
             "actual_reasoner_sm_count": pair.second_sm_count,
             "total_sm_count": pair.total_sm_count,
+            "workqueue": {
+                "mode": (
+                    "balanced" if pair.balanced_workqueues else "shared"
+                ),
+                "concurrency_limit": pair.workqueue_concurrency_limit,
+                "context_configs": pair.workqueue_configs,
+            },
             "generator_stream_handle": int(
                 self._multi_model_generator_stream.cuda_stream
             ),

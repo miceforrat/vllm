@@ -11,12 +11,36 @@ class GreenContextError(RuntimeError):
 
 
 class _DevResource(ctypes.Structure):
-    # cuda.h: enum (4) + internal padding (92) + tagged-union payload (48).
+    # cuda.h: enum (4) + internal padding (92) + a 48-byte ABI tail. CUDA
+    # 13.1 repurposes the first 40 bytes of that tail as the tagged-union
+    # payload and the final 8 bytes as ``nextResource``. Keeping the tail
+    # opaque preserves compatibility with both the pre-13.1 and 13.1+ ABI.
     _fields_ = [("type", ctypes.c_int), ("_padding", ctypes.c_ubyte * 92), ("_payload", ctypes.c_ubyte * 48)]
 
     @property
     def sm_count(self) -> int:
         return int(ctypes.c_uint.from_buffer(self._payload).value)
+
+    def set_balanced_workqueue_config(
+        self, device: int, concurrency_limit: int
+    ) -> None:
+        """Populate the public CUDA 13.1 workqueue-config union member."""
+        if concurrency_limit <= 0:
+            raise ValueError("workqueue concurrency limit must be positive")
+        self.type = 1000  # CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG
+        ctypes.c_int.from_buffer(self._payload, 0).value = device
+        ctypes.c_uint.from_buffer(self._payload, 4).value = concurrency_limit
+        ctypes.c_int.from_buffer(self._payload, 8).value = 1
+
+    @property
+    def workqueue_config(self) -> dict[str, int]:
+        return {
+            "device": int(ctypes.c_int.from_buffer(self._payload, 0).value),
+            "concurrency_limit": int(
+                ctypes.c_uint.from_buffer(self._payload, 4).value
+            ),
+            "sharing_scope": int(ctypes.c_int.from_buffer(self._payload, 8).value),
+        }
 
 
 class GreenContextStream:
@@ -143,6 +167,7 @@ class GreenContextPair:
     _DEFAULT_STREAM = 1
     _STREAM_NON_BLOCKING = 1
     _IGNORE_SM_COSCHEDULING = 1
+    _WORKQUEUE_CONFIG_RESOURCE = 1000
 
     def __init__(
         self,
@@ -150,9 +175,28 @@ class GreenContextPair:
         device: int = 0,
         *,
         ignore_sm_coscheduling: bool = False,
+        balanced_workqueues: bool = False,
+        workqueue_concurrency_limit: int = 1,
     ) -> None:
+        if workqueue_concurrency_limit <= 0:
+            raise ValueError("workqueue_concurrency_limit must be positive")
         self._cuda = ctypes.CDLL(ctypes.util.find_library("cuda") or "libcuda.so.1")
         GreenContextStream._configure_signatures(self)
+        if balanced_workqueues:
+            try:
+                self._cuda.cuCtxFromGreenCtx.argtypes = [
+                    ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.c_void_p,
+                ]
+                self._cuda.cuCtxGetDevResource.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(_DevResource),
+                    ctypes.c_int,
+                ]
+            except AttributeError as exc:
+                raise GreenContextError(
+                    "balanced Green Context workqueues require CUDA 13.1+"
+                ) from exc
         GreenContextStream._check(self, self._cuda.cuInit(0), "cuInit")
 
         cuda_device = ctypes.c_int()
@@ -196,13 +240,26 @@ class GreenContextPair:
 
         self._contexts: list[ctypes.c_void_p] = []
         self._streams: list[ctypes.c_void_p] = []
+        self._workqueue_configs: list[dict[str, int]] = []
         try:
             for resource in (first_resource, second_resource):
                 descriptor = ctypes.c_void_p()
+                descriptor_resources = (_DevResource * (2 if balanced_workqueues else 1))()
+                ctypes.memmove(
+                    ctypes.byref(descriptor_resources[0]),
+                    ctypes.byref(resource),
+                    ctypes.sizeof(_DevResource),
+                )
+                if balanced_workqueues:
+                    descriptor_resources[1].set_balanced_workqueue_config(
+                        cuda_device.value, workqueue_concurrency_limit
+                    )
                 GreenContextStream._check(
                     self,
                     self._cuda.cuDevResourceGenerateDesc(
-                        ctypes.byref(descriptor), ctypes.byref(resource), 1
+                        ctypes.byref(descriptor),
+                        ctypes.cast(descriptor_resources, ctypes.POINTER(_DevResource)),
+                        len(descriptor_resources),
                     ),
                     "cuDevResourceGenerateDesc",
                 )
@@ -215,6 +272,26 @@ class GreenContextPair:
                     "cuGreenCtxCreate",
                 )
                 self._contexts.append(context)
+                if balanced_workqueues:
+                    context_handle = ctypes.c_void_p()
+                    GreenContextStream._check(
+                        self,
+                        self._cuda.cuCtxFromGreenCtx(
+                            ctypes.byref(context_handle), context
+                        ),
+                        "cuCtxFromGreenCtx",
+                    )
+                    actual_workqueue = _DevResource()
+                    GreenContextStream._check(
+                        self,
+                        self._cuda.cuCtxGetDevResource(
+                            context_handle,
+                            ctypes.byref(actual_workqueue),
+                            self._WORKQUEUE_CONFIG_RESOURCE,
+                        ),
+                        "cuCtxGetDevResource(workqueue config)",
+                    )
+                    self._workqueue_configs.append(actual_workqueue.workqueue_config)
                 stream = ctypes.c_void_p()
                 GreenContextStream._check(
                     self,
@@ -233,6 +310,14 @@ class GreenContextPair:
         self.first_sm_count = first_resource.sm_count
         self.second_sm_count = second_resource.sm_count
         self.total_sm_count = available.sm_count
+        self.balanced_workqueues = balanced_workqueues
+        self.workqueue_concurrency_limit = (
+            workqueue_concurrency_limit if balanced_workqueues else None
+        )
+
+    @property
+    def workqueue_configs(self) -> list[dict[str, int]]:
+        return [dict(config) for config in self._workqueue_configs]
 
     @property
     def first_stream_ptr(self) -> int:

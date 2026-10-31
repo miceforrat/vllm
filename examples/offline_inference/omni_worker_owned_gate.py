@@ -342,6 +342,21 @@ def main() -> None:
     )
     parser.add_argument("--generator-sm-count", type=int, default=120)
     parser.add_argument(
+        "--gc-workqueue-mode",
+        choices=("shared", "balanced"),
+        default="shared",
+        help=(
+            "Workqueue policy attached to both Green Context descriptors. "
+            "Balanced requires CUDA 13.1+."
+        ),
+    )
+    parser.add_argument(
+        "--gc-workqueue-concurrency-limit",
+        type=int,
+        default=1,
+        help="Expected concurrent stream-ordered workloads per Green Context.",
+    )
+    parser.add_argument(
         "--full-sm-reference",
         type=Path,
         help=(
@@ -375,6 +390,10 @@ def main() -> None:
             "--engine-shutdown-timeout-seconds must be greater than "
             "--worker-shutdown-timeout-seconds"
         )
+    if args.gc_workqueue_concurrency_limit <= 0:
+        parser.error("--gc-workqueue-concurrency-limit must be positive")
+    if args.generator_stream != "green" and args.gc_workqueue_mode != "shared":
+        parser.error("balanced workqueues require --generator-stream green")
 
     # MultiprocExecutor otherwise gives workers only five seconds to release
     # the primary model, CUDA graphs, KV cache and the auxiliary model.  Keep
@@ -436,7 +455,13 @@ def main() -> None:
             "additional_config": {
                 "multi_model_runtime": {
                     "green_context": {
-                        "generator_sm_count": args.generator_sm_count
+                        "generator_sm_count": args.generator_sm_count,
+                        "workqueue": {
+                            "mode": args.gc_workqueue_mode,
+                            "concurrency_limit": (
+                                args.gc_workqueue_concurrency_limit
+                            ),
+                        },
                     }
                 }
             },
