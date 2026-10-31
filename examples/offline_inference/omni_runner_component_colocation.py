@@ -250,6 +250,21 @@ def main() -> None:
         help="Ignore EOS to create a controlled decode-length benchmark.",
     )
     parser.add_argument("--generator-sm-count", type=int, default=136)
+    parser.add_argument(
+        "--gc-workqueue-mode",
+        choices=("shared", "balanced"),
+        default="shared",
+        help=(
+            "Use the legacy shared CUDA workqueue or attach one balanced "
+            "workqueue to each Green Context."
+        ),
+    )
+    parser.add_argument(
+        "--gc-workqueue-concurrency-limit",
+        type=int,
+        default=1,
+        help="Concurrency limit for each balanced CUDA workqueue.",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.70)
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=1 << 30)
     parser.add_argument("--generator-cache", choices=("none", "sea_cache"), default="sea_cache")
@@ -258,6 +273,8 @@ def main() -> None:
     parser.add_argument("--concurrent-repeats", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.gc_workqueue_concurrency_limit <= 0:
+        parser.error("--gc-workqueue-concurrency-limit must be positive")
 
     reasoner_input = json.loads(args.reasoner_input.read_text())
     prompt = reasoner_input["prompt"]
@@ -284,7 +301,12 @@ def main() -> None:
     from vllm.experimental.green_context import GreenContextPair
 
     device = torch.cuda.current_device()
-    gc_pair = GreenContextPair(args.generator_sm_count, device)
+    gc_pair = GreenContextPair(
+        args.generator_sm_count,
+        device,
+        balanced_workqueues=args.gc_workqueue_mode == "balanced",
+        workqueue_concurrency_limit=args.gc_workqueue_concurrency_limit,
+    )
     generator_stream = torch.cuda.ExternalStream(gc_pair.first_stream_ptr, device=device)
     decode_stream = torch.cuda.ExternalStream(gc_pair.second_stream_ptr, device=device)
     embedded.set_execution_stream(generator_stream)
@@ -418,6 +440,11 @@ def main() -> None:
             "actual_generator_sm_count": gc_pair.first_sm_count,
             "actual_decode_sm_count": gc_pair.second_sm_count,
             "total_sm_count": gc_pair.total_sm_count,
+        },
+        "workqueue": {
+            "mode": args.gc_workqueue_mode,
+            "concurrency_limit": args.gc_workqueue_concurrency_limit,
+            "context_configs": gc_pair.workqueue_configs,
         },
         "reasoner_mode": args.reasoner_mode,
         "generator_mode": "regional_compile",
