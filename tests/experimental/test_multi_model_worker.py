@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 from typing import Any
 
+import vllm.experimental.multi_model_worker as multi_model_worker
 from vllm.experimental.multi_model_worker import (
+    AsyncWorkerHostedRunnerClient,
     CommunicationGroupSpec,
     ModelDeploymentSpec,
     MultiModelWorkerExtension,
@@ -28,6 +31,14 @@ class _FakeEngine:
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
 
     def collective_rpc(
+        self, method: str, *, args: tuple[Any, ...]
+    ) -> list[Any]:
+        self.calls.append((method, args))
+        return self.replies[method]
+
+
+class _FakeAsyncEngine(_FakeEngine):
+    async def collective_rpc(
         self, method: str, *, args: tuple[Any, ...]
     ) -> list[Any]:
         self.calls.append((method, args))
@@ -161,6 +172,98 @@ def test_client_timed_execute_rejects_ambiguous_tp_results() -> None:
         assert "exactly one timed output-owner result" in str(exc)
     else:
         raise AssertionError("Ambiguous timed TP results were accepted")
+
+
+def test_client_starts_and_collects_external_async_job(monkeypatch) -> None:
+    class _JobId:
+        hex = "job-123"
+
+    monkeypatch.setattr(multi_model_worker.uuid, "uuid4", _JobId)
+    result = {"seconds": 2.5}
+    engine = _FakeEngine(
+        {
+            "start_auxiliary_runner": [
+                {"job_id": "job-123", "started": True},
+                {"job_id": "job-123", "started": True},
+            ],
+            "auxiliary_runner_job_status": [
+                {"job_id": "job-123", "done": True},
+                {"job_id": "job-123", "done": True},
+            ],
+            "collect_auxiliary_runner": [result, None],
+        }
+    )
+    client = WorkerHostedRunnerClient(engine)
+    request = object()
+
+    future = client.start_async("generator-a", request)
+
+    assert future.model_id == "generator-a"
+    assert future.job_id == "job-123"
+    assert future.done()
+    assert future.result() is result
+    assert future.result() is result
+    assert engine.calls == [
+        (
+            "start_auxiliary_runner",
+            ("generator-a", request, False, "job-123"),
+        ),
+        (
+            "auxiliary_runner_job_status",
+            ("generator-a", "job-123"),
+        ),
+        (
+            "collect_auxiliary_runner",
+            ("generator-a", "job-123", None),
+        ),
+    ]
+
+
+def test_async_client_starts_and_collects_external_job(monkeypatch) -> None:
+    class _JobId:
+        hex = "async-job-123"
+
+    monkeypatch.setattr(multi_model_worker.uuid, "uuid4", _JobId)
+    result = {"seconds": 1.25}
+    engine = _FakeAsyncEngine(
+        {
+            "start_auxiliary_runner": [
+                {"job_id": "async-job-123", "started": True},
+                {"job_id": "async-job-123", "started": True},
+            ],
+            "auxiliary_runner_job_status": [
+                {"job_id": "async-job-123", "done": True},
+                {"job_id": "async-job-123", "done": True},
+            ],
+            "collect_auxiliary_runner": [result, None],
+        }
+    )
+    client = AsyncWorkerHostedRunnerClient(engine)
+    request = object()
+
+    async def exercise() -> None:
+        future = await client.start_async("generator-a", request)
+        assert future.model_id == "generator-a"
+        assert future.job_id == "async-job-123"
+        assert await future.done()
+        assert await future.result() is result
+        assert await future.result() is result
+
+    asyncio.run(exercise())
+    assert engine.calls == [
+        (
+            "start_auxiliary_runner",
+            ("generator-a", request, False, "async-job-123"),
+        ),
+        (
+            "auxiliary_runner_job_status",
+            ("generator-a", "async-job-123"),
+        ),
+        (
+            "collect_auxiliary_runner",
+            ("generator-a", "async-job-123", None),
+        ),
+    ]
 
 
 

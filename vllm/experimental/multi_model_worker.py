@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Mapping
@@ -69,6 +70,8 @@ class _RunnerSlot:
     communication_group_ids: tuple[str, ...] = ()
     pending_future: Future[Any] | None = None
     pending_start: threading.Event | None = None
+    pending_started: threading.Event | None = None
+    pending_job_id: str | None = None
 
 
 @dataclass
@@ -248,13 +251,19 @@ class MultiModelWorkerExtension:
         return pool
 
     def prepare_auxiliary_runner(
-        self, model_id: str, request: Any, profile_memory: bool = False
+        self,
+        model_id: str,
+        request: Any,
+        profile_memory: bool = False,
+        job_id: str | None = None,
     ) -> dict[str, Any]:
         """Prepare a worker-local asynchronous forward behind a start gate."""
         slot = self._get_auxiliary_slot(model_id)
         if slot.pending_future is not None:
             raise RuntimeError(f"Runner {model_id!r} already has pending work")
         start = threading.Event()
+        started = threading.Event()
+        resolved_job_id = job_id or f"prepared-{model_id}"
 
         def run() -> Any:
             if not start.wait(timeout=300.0):
@@ -264,16 +273,49 @@ class MultiModelWorkerExtension:
             import torch
 
             torch.cuda.set_device(self.device)
+            started.set()
             return self.execute_auxiliary_runner_timed(
                 model_id, request, profile_memory
             )
 
         slot.pending_start = start
+        slot.pending_started = started
+        slot.pending_job_id = resolved_job_id
         slot.pending_future = self._auxiliary_thread_pool().submit(run)
         return {
             "model_id": model_id,
+            "job_id": resolved_job_id,
             "rank": int(self.rank),
             "prepared": True,
+        }
+
+    def start_auxiliary_runner(
+        self,
+        model_id: str,
+        request: Any,
+        profile_memory: bool = False,
+        job_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Start an auxiliary forward independently of primary-model work."""
+        prepared = self.prepare_auxiliary_runner(
+            model_id,
+            request,
+            profile_memory,
+            job_id,
+        )
+        slot = self._get_auxiliary_slot(model_id)
+        assert slot.pending_start is not None
+        assert slot.pending_started is not None
+        slot.pending_start.set()
+        slot.pending_start = None
+        if not slot.pending_started.wait(timeout=30.0):
+            raise TimeoutError(
+                f"Timed out starting auxiliary runner {model_id!r}"
+            )
+        return {
+            **prepared,
+            "prepared": False,
+            "started": True,
         }
 
     def release_prepared_auxiliary_runners(self) -> list[str]:
@@ -281,19 +323,55 @@ class MultiModelWorkerExtension:
         for model_id, slot in self._auxiliary_runner_slots().items():
             if slot.pending_start is not None:
                 slot.pending_start.set()
+                slot.pending_start = None
                 released.append(model_id)
         return released
 
-    def collect_auxiliary_runner(self, model_id: str) -> Any:
+    def auxiliary_runner_job_status(
+        self, model_id: str, job_id: str | None = None
+    ) -> dict[str, Any]:
         slot = self._get_auxiliary_slot(model_id)
+        if job_id is not None and slot.pending_job_id != job_id:
+            raise RuntimeError(
+                f"Runner {model_id!r} has job {slot.pending_job_id!r}, "
+                f"not {job_id!r}"
+            )
+        future = slot.pending_future
+        return {
+            "model_id": model_id,
+            "job_id": slot.pending_job_id,
+            "rank": int(self.rank),
+            "pending": future is not None,
+            "started": (
+                slot.pending_started is not None
+                and slot.pending_started.is_set()
+            ),
+            "done": future is not None and future.done(),
+        }
+
+    def collect_auxiliary_runner(
+        self,
+        model_id: str,
+        job_id: str | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        slot = self._get_auxiliary_slot(model_id)
+        if job_id is not None and slot.pending_job_id != job_id:
+            raise RuntimeError(
+                f"Runner {model_id!r} has job {slot.pending_job_id!r}, "
+                f"not {job_id!r}"
+            )
         future = slot.pending_future
         if future is None:
             raise RuntimeError(f"Runner {model_id!r} has no pending work")
         try:
-            return future.result()
+            return future.result(timeout=timeout)
         finally:
-            slot.pending_future = None
-            slot.pending_start = None
+            if future.done():
+                slot.pending_future = None
+                slot.pending_start = None
+                slot.pending_started = None
+                slot.pending_job_id = None
 
     def create_auxiliary_execution_stream(
         self,
@@ -326,6 +404,8 @@ class MultiModelWorkerExtension:
                 slot.pending_future.result()
                 slot.pending_future = None
                 slot.pending_start = None
+                slot.pending_started = None
+                slot.pending_job_id = None
             # Drop the registry's duplicate runner reference before adapter
             # teardown.  This lets the runner/pipeline destruct while the Omni
             # compatibility group views are still installed.
@@ -540,11 +620,41 @@ class WorkerHostedRunnerClient:
             "prepare_auxiliary_runner", model_id, request, profile_memory
         )
 
+    def start_async(
+        self, model_id: str, request: Any, *, profile_memory: bool = False
+    ) -> "WorkerHostedRunnerFuture":
+        """Start Generator work now and return without waiting for completion."""
+        job_id = uuid.uuid4().hex
+        results = self._rpc(
+            "start_auxiliary_runner",
+            model_id,
+            request,
+            profile_memory,
+            job_id,
+        )
+        if not results or not all(
+            row.get("job_id") == job_id and row.get("started")
+            for row in results
+        ):
+            raise RuntimeError(
+                f"Auxiliary job {job_id!r} did not start on every worker: "
+                f"{results!r}"
+            )
+        return WorkerHostedRunnerFuture(self, model_id, job_id)
+
     def release_prepared(self) -> list[list[str]]:
         return self._rpc("release_prepared_auxiliary_runners")
 
-    def collect(self, model_id: str) -> Any:
-        results = self._rpc("collect_auxiliary_runner", model_id)
+    def collect(
+        self,
+        model_id: str,
+        *,
+        job_id: str | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        results = self._rpc(
+            "collect_auxiliary_runner", model_id, job_id, timeout
+        )
         outputs = [result for result in results if result is not None]
         if len(outputs) != 1:
             raise RuntimeError(
@@ -552,6 +662,11 @@ class WorkerHostedRunnerClient:
                 f"{len(outputs)} outputs from {len(results)} workers"
             )
         return outputs[0]
+
+    def job_status(
+        self, model_id: str, *, job_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._rpc("auxiliary_runner_job_status", model_id, job_id)
 
     def metadata(self, model_id: str) -> list[dict[str, Any]]:
         return self._rpc("auxiliary_runner_metadata", model_id)
@@ -565,3 +680,198 @@ class WorkerHostedRunnerClient:
     def _rpc(self, method: str, *args: Any) -> list[Any]:
         return self._llm_engine.collective_rpc(method, args=args)
 
+
+class WorkerHostedRunnerFuture:
+    """External handle for one Worker-hosted auxiliary-model request."""
+
+    def __init__(
+        self,
+        client: WorkerHostedRunnerClient,
+        model_id: str,
+        job_id: str,
+    ) -> None:
+        self._client = client
+        self.model_id = model_id
+        self.job_id = job_id
+        self._resolved = False
+        self._result: Any = None
+
+    def done(self) -> bool:
+        if self._resolved:
+            return True
+        statuses = self._client.job_status(
+            self.model_id, job_id=self.job_id
+        )
+        return bool(statuses) and all(row["done"] for row in statuses)
+
+    def result(self, timeout: float | None = None) -> Any:
+        if not self._resolved:
+            self._result = self._client.collect(
+                self.model_id,
+                job_id=self.job_id,
+                timeout=timeout,
+            )
+            self._resolved = True
+        return self._result
+
+
+class AsyncWorkerHostedRunnerClient(WorkerHostedRunnerClient):
+    """AsyncLLM frontend for runners owned by the same GPU workers.
+
+    This client deliberately mirrors :class:`WorkerHostedRunnerClient`, but
+    awaits ``AsyncLLM.collective_rpc`` instead of blocking the caller.  Keeping
+    the two clients separate preserves the synchronous benchmark path while
+    allowing a serving-style event loop to submit Reasoner and Generator work
+    independently.
+    """
+
+    async def register(
+        self, spec: ModelDeploymentSpec
+    ) -> list[dict[str, Any]]:
+        planned = self._plan_homogeneous_tp(spec)
+        return await self._rpc_async(
+            "register_auxiliary_runner", planned.to_rpc_payload()
+        )
+
+    async def topology(
+        self, worker_ranks: tuple[int, ...] = ()
+    ) -> list[dict[str, Any]]:
+        return await self._rpc_async(
+            "inspect_multi_model_topology", worker_ranks
+        )
+
+    async def configure_stream(
+        self,
+        model_id: str,
+        *,
+        kind: str,
+        sm_count: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self._rpc_async(
+            "create_auxiliary_execution_stream", model_id, kind, sm_count
+        )
+
+    async def execute(
+        self, model_id: str, request: Any, *, profile_memory: bool = False
+    ) -> Any:
+        results = await self._rpc_async(
+            "execute_auxiliary_runner", model_id, request, profile_memory
+        )
+        return self._one_output(results, "output-owner")
+
+    async def execute_timed(
+        self, model_id: str, request: Any, *, profile_memory: bool = False
+    ) -> dict[str, Any]:
+        results = await self._rpc_async(
+            "execute_auxiliary_runner_timed",
+            model_id,
+            request,
+            profile_memory,
+        )
+        return self._one_output(results, "timed output-owner")
+
+    async def prepare(
+        self, model_id: str, request: Any, *, profile_memory: bool = False
+    ) -> list[dict[str, Any]]:
+        return await self._rpc_async(
+            "prepare_auxiliary_runner", model_id, request, profile_memory
+        )
+
+    async def release_prepared(self) -> list[list[str]]:
+        return await self._rpc_async("release_prepared_auxiliary_runners")
+
+    async def start_async(
+        self, model_id: str, request: Any, *, profile_memory: bool = False
+    ) -> "AsyncWorkerHostedRunnerFuture":
+        job_id = uuid.uuid4().hex
+        results = await self._rpc_async(
+            "start_auxiliary_runner",
+            model_id,
+            request,
+            profile_memory,
+            job_id,
+        )
+        if not results or not all(
+            row.get("job_id") == job_id and row.get("started")
+            for row in results
+        ):
+            raise RuntimeError(
+                f"Auxiliary job {job_id!r} did not start on every worker: "
+                f"{results!r}"
+            )
+        return AsyncWorkerHostedRunnerFuture(self, model_id, job_id)
+
+    async def collect(
+        self,
+        model_id: str,
+        *,
+        job_id: str | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        results = await self._rpc_async(
+            "collect_auxiliary_runner", model_id, job_id, timeout
+        )
+        return self._one_output(results, "asynchronous output-owner")
+
+    async def job_status(
+        self, model_id: str, *, job_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        return await self._rpc_async(
+            "auxiliary_runner_job_status", model_id, job_id
+        )
+
+    async def metadata(self, model_id: str) -> list[dict[str, Any]]:
+        return await self._rpc_async("auxiliary_runner_metadata", model_id)
+
+    async def resource_plan(self) -> list[dict[str, Any]]:
+        return await self._rpc_async("multi_model_resource_plan")
+
+    async def close(self) -> list[list[str]]:
+        return await self._rpc_async("close_auxiliary_runners")
+
+    async def _rpc_async(self, method: str, *args: Any) -> list[Any]:
+        return await self._llm_engine.collective_rpc(method, args=args)
+
+    @staticmethod
+    def _one_output(results: list[Any], label: str) -> Any:
+        outputs = [result for result in results if result is not None]
+        if len(outputs) != 1:
+            raise RuntimeError(
+                f"Expected exactly one {label} rank, got "
+                f"{len(outputs)} outputs from {len(results)} workers"
+            )
+        return outputs[0]
+
+
+class AsyncWorkerHostedRunnerFuture:
+    """Awaitable handle for one Worker-hosted auxiliary-model request."""
+
+    def __init__(
+        self,
+        client: AsyncWorkerHostedRunnerClient,
+        model_id: str,
+        job_id: str,
+    ) -> None:
+        self._client = client
+        self.model_id = model_id
+        self.job_id = job_id
+        self._resolved = False
+        self._result: Any = None
+
+    async def done(self) -> bool:
+        if self._resolved:
+            return True
+        statuses = await self._client.job_status(
+            self.model_id, job_id=self.job_id
+        )
+        return bool(statuses) and all(row["done"] for row in statuses)
+
+    async def result(self, timeout: float | None = None) -> Any:
+        if not self._resolved:
+            self._result = await self._client.collect(
+                self.model_id,
+                job_id=self.job_id,
+                timeout=timeout,
+            )
+            self._resolved = True
+        return self._result

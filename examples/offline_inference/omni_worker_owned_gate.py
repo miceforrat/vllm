@@ -122,19 +122,33 @@ def _run_concurrent_once(
     reasoner_prompt: str,
     index: int,
 ) -> dict[str, Any]:
-    client.prepare(
-        model_id,
-        _make_generator_request(args, f"worker-concurrent-{index:02d}"),
-        profile_memory=False,
+    generator_request = _make_generator_request(
+        args, f"worker-concurrent-{index:02d}"
     )
+    generator_future = None
+    if args.concurrent_start_mode == "reasoner_coupled":
+        client.prepare(
+            model_id,
+            generator_request,
+            profile_memory=False,
+        )
 
-    # A Green-Context worker releases its local Generator future immediately
-    # before entering the Reasoner's execute_model(). Other worker types lack
-    # that hook, so release explicitly before submitting the Reasoner.
-    if args.generator_stream != "green":
-        client.release_prepared()
+        # A Green-Context worker releases its local Generator future immediately
+        # before entering the Reasoner's execute_model(). Other worker types lack
+        # that hook, so release explicitly before submitting the Reasoner.
+        if args.generator_stream != "green":
+            client.release_prepared()
+        wall_start = time.perf_counter()
+    else:
+        wall_start = time.perf_counter()
+        generator_future = client.start_async(
+            model_id,
+            generator_request,
+            profile_memory=False,
+        )
+        if args.reasoner_arrival_delay_seconds:
+            time.sleep(args.reasoner_arrival_delay_seconds)
 
-    wall_start = time.perf_counter()
     reasoner_start = time.perf_counter()
     with torch.cuda.nvtx.range(f"worker.concurrent.reasoner.{index}"):
         reasoner_result = _run_reasoner(
@@ -147,7 +161,11 @@ def _run_concurrent_once(
         **reasoner_result,
     }
 
-    generator_result = client.collect(model_id)
+    generator_result = (
+        client.collect(model_id)
+        if generator_future is None
+        else generator_future.result()
+    )
     if generator_result is None:
         raise RuntimeError("Generator owner rank returned no async result")
     wall_end = time.perf_counter()
@@ -164,6 +182,10 @@ def _run_concurrent_once(
         "host_wall_seconds": wall_end - wall_start,
         "host_overlap_seconds": overlap,
         "host_overlap_over_shorter": overlap / shorter if shorter else 0.0,
+        "start_mode": args.concurrent_start_mode,
+        "reasoner_arrival_delay_seconds": (
+            args.reasoner_arrival_delay_seconds
+        ),
     }
 
 
@@ -306,6 +328,24 @@ def main() -> None:
     parser.add_argument("--generator-repeats", type=int, default=1)
     parser.add_argument("--alone-repeats", type=int, default=0)
     parser.add_argument("--concurrent-repeats", type=int, default=0)
+    parser.add_argument(
+        "--concurrent-start-mode",
+        choices=("reasoner_coupled", "generator_first"),
+        default="reasoner_coupled",
+        help=(
+            "Keep the existing Reasoner-coupled release path, or start the "
+            "Generator externally before submitting the Reasoner request."
+        ),
+    )
+    parser.add_argument(
+        "--reasoner-arrival-delay-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "In generator_first mode, delay the external Reasoner request "
+            "after the Generator has started."
+        ),
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.70)
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=1 << 30)
     parser.add_argument(
@@ -367,6 +407,8 @@ def main() -> None:
         )
     if args.worker_shutdown_timeout_seconds <= 0:
         parser.error("--worker-shutdown-timeout-seconds must be > 0")
+    if args.reasoner_arrival_delay_seconds < 0:
+        parser.error("--reasoner-arrival-delay-seconds must be >= 0")
     if (
         args.engine_shutdown_timeout_seconds
         <= args.worker_shutdown_timeout_seconds
