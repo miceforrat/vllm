@@ -19,7 +19,7 @@
 - 整个 Hugging Face cache。只复制 Cosmos3-Edge snapshot，或者在新机器重新下载；
 - 旧容器中手工安装且未记录的系统包。
 
-CUDA 13.2 驱动能够运行 cu130 构建的 PyTorch/vLLM。第一阶段因此继续使用已经验证过的 cu130 Python 二进制栈，仅用新主机的 R595 驱动和 CUDA 13.2 Toolkit 验证 workqueue。不要一开始同时升级 PyTorch、vLLM、Omni 和 Transformers，否则无法区分环境问题与 workqueue 行为。
+新服务器已经确认使用 NVIDIA Driver 595.99.02 和 CUDA 13.2。主环境直接使用 PyTorch 2.13 cu132，并从当前 vLLM 0.31 分支源码编译 CUDA 扩展。旧 cu130 环境只作为旧服务器回归基线，不再作为新服务器主运行环境。
 
 ## 2. 当前代码存档状态
 
@@ -81,7 +81,7 @@ profiling_tools/runners/single_process_dual_engine_matched.py
 
 1. 使用宿主机 CUDA 13.2 Toolkit 运行 standalone workqueue probe；
 2. probe 通过后，创建独立的用户态 Python venv；
-3. venv 中继续使用已验证的 cu130 PyTorch/vLLM 二进制栈；
+3. Conda 环境中安装 PyTorch 2.13 cu132，并从源码编译当前 vLLM 分支；
 4. 不修改系统 Python，不向系统 site-packages 安装包；
 5. Docker 网络恢复后，再把同一流程迁入容器。
 
@@ -119,7 +119,7 @@ docker run --rm --gpus all \
 Docker 验收条件：
 
 - GPU 显示 RTX 5090；
-- 驱动属于支持 CUDA 13.2 的 R595 系列或更高；
+- 驱动为已验证的 595.99.02，且不低于 CUDA 13.2 GA 要求的 595.45.04；
 - 容器内可以看到 GPU；
 - `/usr/local/cuda/bin/nvcc --version` 显示 CUDA 13.2。
 
@@ -183,14 +183,19 @@ python -m pip install uv
 mkdir -p /data/cjh/cosmos3-workspace
 cd /data/cjh/cosmos3-workspace
 
-git clone git@github.com:miceforrat/vllm.git vllm-single-framework
+git clone https://github.com/miceforrat/vllm.git vllm-single-framework
 cd /data/cjh/cosmos3-workspace/vllm-single-framework
 git checkout experiment/omni-model-backend
 
 cd /data/cjh/cosmos3-workspace
-git clone git@github.com:miceforrat/vllm-omni.git vllm-omni
+git clone https://github.com/miceforrat/vllm-omni.git vllm-omni
 cd /data/cjh/cosmos3-workspace/vllm-omni
 git checkout experiment/cosmos3-dual-framework
+
+cd /data/cjh/cosmos3-workspace
+git clone https://github.com/miceforrat/cosmos-framework.git cosmos-framework
+cd /data/cjh/cosmos3-workspace/cosmos-framework
+git checkout experiment/vllm-omni-single-framework
 ```
 
 固定并记录实际提交：
@@ -202,75 +207,182 @@ git -C /data/cjh/cosmos3-workspace/vllm-single-framework status --short
 git -C /data/cjh/cosmos3-workspace/vllm-omni status --short
 ```
 
-## 7. 使用 Conda 重建隔离的 Python 栈
+## 7. 使用 Conda 构建 CUDA 13.2 运行环境
 
-旧环境的已知版本为：
+### 7.1 固定的软件组合
+
+新服务器已确认：
 
 ```text
-Python       3.13
-torch        2.13.0+cu130
-torchvision  0.28.0+cu130
-vllm         0.31.0+precompiled
-vllm-omni    0.31.0rc2.dev288
-transformers 5.17.0
-triton       3.7.1
-flashinfer   0.7.0.post1
+GPU            NVIDIA GeForce RTX 5090
+Driver         595.99.02
+Driver CUDA    13.2
+Toolkit        CUDA 13.2
+Python         3.13
+PyTorch        2.13.0+cu132
+TorchVision    0.28.0+cu132
+vLLM           当前 experiment/omni-model-backend 分支，源码编译
+vLLM-Omni      experiment/cosmos3-dual-framework，editable source
+Transformers   5.17.0
 ```
 
-推荐继续使用 cu130 Python 栈。CUDA 13.2 驱动向后兼容 cu130 用户态二进制；不要把 `/usr/local/cuda-13.2/lib64` 强行放到 `LD_LIBRARY_PATH` 前面覆盖 wheel 自带依赖。
+CUDA 13.2 GA 的官方最低 Linux 驱动是 595.45.04；当前 595.99.02 满足要求。PyTorch 2.13 提供官方 cu132 wheel。当前 vLLM 0.31 的公开预编译 CUDA 变体不能作为 cu132 主环境依据，因此使用现有 PyTorch cu132，并从本仓库源码编译 vLLM 扩展。
 
-先确认 Conda：
+### 7.2 在用户目录安装 Conda
 
-```bash
-conda --version
-```
-
-如果宿主机没有 Conda，可以无 root 安装 Miniconda：
+宿主机不依赖系统 Conda，也不需要 root。Miniconda 固定安装到当前用户的 `$HOME/miniconda3`：
 
 ```bash
 curl -fsSLo /tmp/miniconda.sh \
   https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+
 bash /tmp/miniconda.sh -b -p "$HOME/miniconda3"
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda config --set auto_activate_base false
 conda --version
 ```
 
-如果当前 shell 尚未初始化 Conda：
+后续新 shell 均使用：
 
 ```bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
 ```
 
-创建固定名称的环境：
+不执行 `sudo conda`，也不把 Conda 安装到 `/opt`、`/usr/local` 或其他系统目录。
+
+### 7.3 创建 Conda 环境
+
+创建固定名称环境：
 
 ```bash
 conda create -n vllm-omni-co-cu132 python=3.13 pip -y
-source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate vllm-omni-co-cu132
 
 python -m pip install --upgrade pip
 python -m pip install uv
 ```
 
-Conda 负责环境隔离；环境内使用 `uv pip` 是为了明确选择 cu130 PyTorch backend：
+不要使用 Conda base 环境，不要复制旧 `.venv`，也不要执行 `sudo pip install`。
+
+### 7.4 安装 PyTorch cu132
 
 ```bash
-export UV_HTTP_TIMEOUT=600
-export UV_HTTP_RETRIES=20
-
-uv pip install --python "$(which python)" --torch-backend=cu130 \
-  "vllm==0.31.0" \
-  "transformers==5.17.0"
-
-uv pip install --python "$(which python)" --no-deps \
-  -e /data/cjh/cosmos3-workspace/vllm-omni
+uv pip install --python "$(which python)" \
+  torch==2.13.0 \
+  torchvision==0.28.0 \
+  --index-url https://download.pytorch.org/whl/cu132
 ```
 
-不要复制旧 `.venv`，不要使用 Conda base 环境，也不要执行 `sudo pip install`。如果 Omni import 报缺包，根据旧环境的 freeze 补齐依赖，不要升级核心版本。
-
-验证并记录环境：
+立即验证，不能继续使用显示 `cu130` 的环境：
 
 ```bash
+python - <<"PY"
+import torch
+import torchvision
+
+print("torch:", torch.__version__)
+print("torch CUDA:", torch.version.cuda)
+print("torchvision:", torchvision.__version__)
+print("GPU:", torch.cuda.get_device_name(0))
+print("capability:", torch.cuda.get_device_capability(0))
+
+assert torch.version.cuda == "13.2", torch.version.cuda
+assert torch.cuda.get_device_capability(0) == (12, 0)
+PY
+```
+
+### 7.5 从源码编译当前 vLLM 分支
+
+先确认编译工具：
+
+```bash
+nvcc --version
+gcc --version
+cmake --version
+ninja --version
+```
+
+vLLM 要求 GCC/G++ 至少 11.3。缺少用户态构建工具时，可以装入 Conda 环境：
+
+```bash
+conda install -n vllm-omni-co-cu132 -c conda-forge \
+  cmake ninja ccache gcc_linux-64=12 gxx_linux-64=12 -y
+
+conda activate vllm-omni-co-cu132
+export CC="$(which x86_64-conda-linux-gnu-gcc)"
+export CXX="$(which x86_64-conda-linux-gnu-g++)"
+```
+
+使用已经安装的 PyTorch cu132 构建：
+
+```bash
+cd /data/cjh/cosmos3-workspace/vllm-single-framework
+
+python tools/use_existing_torch.py
+uv pip install --python "$(which python)" \
+  -r requirements/build/cuda.txt
+
+export CUDA_HOME=/usr/local/cuda-13.2
+export PATH="$CUDA_HOME/bin:$PATH"
+export VLLM_MAIN_CUDA_VERSION=13.2
+export TORCH_CUDA_ARCH_LIST=12.0
+export MAX_JOBS=8
+export NVCC_THREADS=4
+export CCACHE_NOHASHDIR=true
+
+uv pip install --python "$(which python)" \
+  --no-build-isolation -e .
+```
+
+
+如果宿主机 Toolkit 的真实目录不是 `/usr/local/cuda-13.2`，以 `readlink -f $(which nvcc)` 和 `/usr/local/cuda` 的实际指向为准。
+
+验证 vLLM 的 Python 包和 CUDA 扩展来自当前源码环境：
+
+```bash
+python - <<"PY"
+import torch
+import vllm
+import vllm._C
+
+print("torch:", torch.__version__)
+print("torch CUDA:", torch.version.cuda)
+print("vllm:", vllm.__version__)
+print("vllm source:", vllm.__file__)
+print("vllm._C:", vllm._C.__file__)
+PY
+```
+
+### 7.6 接入 vLLM-Omni 源码
+
+```bash
+cd /data/cjh/cosmos3-workspace/vllm-omni
+
+# 安装 Omni 运行依赖；torch 2.13.0+cu132 已满足其 torch 约束。
+uv pip install --python "$(which python)" \
+  -r requirements/cuda.txt
+
+# 代码本体以 editable source 接入，不再让安装器重新解析 vLLM/PyTorch。
+uv pip install --python "$(which python)" \
+  --no-deps -e .
+```
+
+保留 `transformers==5.17.0`：
+
+```bash
+uv pip install --python "$(which python)" \
+  "transformers==5.17.0"
+```
+
+如果 Omni import 报缺少依赖，根据旧环境 freeze 补齐具体包，不要用一次无约束升级改变 PyTorch、Transformers 或 vLLM。
+
+### 7.7 保存环境清单
+
+```bash
+mkdir -p /data/cjh/runtime/vllm-omni-co-cu132
+python -m pip freeze > /data/cjh/runtime/vllm-omni-co-cu132/freeze.txt
+conda env export --no-builds > /data/cjh/runtime/vllm-omni-co-cu132/environment.yml
+
 python - <<"PY"
 import importlib.metadata as m
 import torch
@@ -280,21 +392,14 @@ for name in ("torch", "torchvision", "vllm", "vllm-omni", "transformers", "trito
         print(name, m.version(name))
     except m.PackageNotFoundError:
         print(name, "NOT INSTALLED")
-
 print("torch CUDA:", torch.version.cuda)
-print("device:", torch.cuda.get_device_name(0))
-print("capability:", torch.cuda.get_device_capability(0))
 PY
-
-mkdir -p /data/cjh/runtime/vllm-omni-co-cu132
-python -m pip freeze > /data/cjh/runtime/vllm-omni-co-cu132/freeze.txt
-conda env export --no-builds > /data/cjh/runtime/vllm-omni-co-cu132/environment.yml
 ```
 
 ## 8. 通用运行环境
 
 ```bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate vllm-omni-co-cu132
 
 export PYTHONPATH=/data/cjh/cosmos3-workspace/vllm-single-framework:/data/cjh/cosmos3-workspace/vllm-omni
@@ -429,7 +534,7 @@ cd /data/cjh/cosmos3/cosmos3-workspace/vllm-single-framework
 
 git add \
   examples/offline_inference/cuda_green_context_workqueue_probe.cu \
-  docs/design/rtx5090_cuda132_minimal_bootstrap.md
+  docs/design/cosmos3_single_framework/rtx5090_cuda132_minimal_bootstrap.md
 
 git commit -m '[Experimental] Add CUDA GC workqueue migration probe'
 git push
@@ -449,7 +554,7 @@ git diff --cached --stat
 迁移完成不等于“容器启动成功”。本阶段的验收标准是：
 
 1. 两个仓库能从远端精确 checkout；
-2. cu130 Python 栈在 CUDA 13.2/R595 主机上加载 RTX 5090；
+2. PyTorch cu132 与源码编译的 vLLM CUDA 扩展均成功加载 RTX 5090；
 3. Cosmos3-Edge 单进程双模型 smoke test 通过；
 4. standalone workqueue probe 打印 `PASS`；
 5. GC runtime 接入 workqueue 后，Nsys 证明两个 workload 仍在各自 GC stream/context 上；

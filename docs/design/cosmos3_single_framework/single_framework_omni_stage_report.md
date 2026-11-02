@@ -43,7 +43,7 @@ vLLM 负责基础资源的创建与所有权；Omni Runner 保留模型加载、
 | allocator API | `vllm/device_allocator/cumem.py` | +39 | tagged pool 的显式复用接口 |
 | Gate/实验入口 | `examples/offline_inference/*.py` | 2054 | 串行、无 GC、GC、组件影响验证，不属于框架核心 |
 | 标准负载 | `examples/offline_inference/workloads/*.json` | 24 | 固定 T2V workload |
-| 设计文档 | `docs/design/vllm_omni_runner_resource_adapter_design.md` | 246 | 设计草案 |
+| 设计文档 | `docs/design/cosmos3_single_framework/vllm_omni_runner_resource_adapter_design.md` | 246 | 设计草案 |
 
 所以“接入 Omni 之外”的 vLLM 核心技术代码约为 886 行：Adapter 460、GC 262、Graph patch 125、allocator 39。约 2k 行 Gate 代码主要用于验证和测量，不能算成生产运行时的必要体积。
 
@@ -439,3 +439,338 @@ Reasoner 侧保留 vLLM：
 | Runner provider/peak | `vllm_omni/diffusion/worker/diffusion_model_runner.py` |
 | SeaCache provider | `vllm_omni/diffusion/cache/seacache/{backend,hook}.py` |
 | UND cache provider | `vllm_omni/diffusion/models/cosmos3/transformer_cosmos3.py` |
+
+
+## 9. 代码导读：从请求入口读到资源底层
+
+本节给出建议阅读路径和关键实现。片段来自当前提交；定位时优先搜索类名或函数名，不依赖容易漂移的行号。
+
+### 9.1 主调用链
+
+```text
+omni_runner_dual_model_gate.py::main
+  ├─ resolve_omni_diffusion_stage
+  │    └─ Omni 官方 resolve_omni_config / OmniDiffusionConfig
+  ├─ EmbeddedOmniDiffusionRunner.start
+  │    ├─ create_diffusion_vllm_config
+  │    ├─ init_worker_distr ibuted_environment
+  │    ├─ _install_omni_group_views
+  │    ├─ 原始 Omni DiffusionModelRunner
+  │    └─ DiffusionModelRunner.load_model(memory_pool_context_fn=...)
+  ├─ vLLM LLM.generate                         # Reasoner
+  └─ EmbeddedOmniDiffusionRunner.execute_model # Generator
+       └─ Omni DiffusionModelRunner.execute_model
+            └─ Cosmos3OmniDiffusersPipeline
+```
+
+Gate 负责负载、计时和证据记录；`EmbeddedOmniDiffusionRunner` 才是运行时适配层。先用下面命令找到 Gate 的组装点：
+
+```bash
+rg -n "resolve_omni_diffusion_stage|EmbeddedOmniDiffusionRunner|embedded.start|LLM\(" \
+  examples/offline_inference/omni_runner_dual_model_gate.py
+```
+
+### 9.2 配置仍然走 Omni 官方 resolver
+
+文件：`vllm/experimental/omni_runner_adapter.py`
+
+函数：`resolve_omni_diffusion_stage()`
+
+```python
+resolution = resolve_omni_config(
+    model,
+    trust_remote_code=trust_remote_code,
+    deploy_config_path=deploy_config_path,
+    cli_overrides=overrides,
+    stage_overrides=None,
+    strategy_config_path=None,
+)
+stage_config = resolution.stage_configs[0]
+engine_args = build_engine_args_dict_from_omni_stage_config(stage_config, model)
+diffusion_kwargs = extract_diffusion_stage_config_kwargs(
+    engine_args,
+    stage_id=stage_config.stage_id,
+    include_engine_adapter_metadata=True,
+)
+diffusion_config = OmniDiffusionConfig(**filtered_kwargs)
+diffusion_config.enrich_config()
+```
+
+Adapter 只额外要求解析结果为一个 diffusion stage。模型注册、Pipeline class、cache 和 compile 配置仍由 Omni 解释，因此没有复制 Cosmos3 配置解析器。
+
+### 9.3 `start()` 如何形成单进程双模型
+
+函数：`EmbeddedOmniDiffusionRunner.start()`
+
+```python
+self.vllm_config = create_diffusion_vllm_config(self.device, od_config)
+current_omni_platform.init_diffusion_worker_vllm_config(self.vllm_config)
+
+self._exit_stack.enter_context(set_current_vllm_config(self.vllm_config))
+self._exit_stack.enter_context(
+    set_forward_context(
+        vllm_config=self.vllm_config,
+        omni_diffusion_config=od_config,
+    )
+)
+
+init_worker_distributed_environment(
+    self.vllm_config,
+    rank=0,
+    distributed_init_method="env://",
+    local_rank=0,
+    backend="nccl",
+)
+self._install_omni_group_views(
+    world=get_world_group(), tp=get_tp_group(), pp=get_pp_group()
+)
+
+self.runner = DiffusionModelRunner(
+    vllm_config=self.vllm_config,
+    od_config=od_config,
+    device=self.device,
+)
+self.runner.load_model(
+    memory_pool_context_fn=memory_pool_context_fn,
+    load_format=load_format,
+)
+```
+
+关键点是直接实例化原始 `DiffusionModelRunner`，没有启动第二套 Omni Engine、Orchestrator 或 Worker 进程。建议依次在 `start()`、`DiffusionModelRunner.load_model()`、`DiffusersPipelineLoader.load_model()` 和 Cosmos3 Pipeline 调用入口打断点。
+
+### 9.4 并行组借用的真实实现
+
+Omni 模型代码通过模块级 `parallel_state._SP/_CFG/...` 读取 group，而不是从 Runner 实例获取 provider。单卡兼容视图将这些入口映射到 vLLM 已建立的 coordinator：
+
+```python
+class _SingleRankGroupView:
+    world_size = 1
+    rank_in_group = 0
+    ulysses_world_size = 1
+    ring_world_size = 1
+
+    def __init__(self, coordinator):
+        self.coordinator = coordinator
+
+    @property
+    def ulysses_group(self):
+        return self.coordinator.device_group
+
+    def __getattr__(self, name):
+        return getattr(self.coordinator, name)
+```
+
+安装位于 `_install_omni_group_views()`：
+
+```python
+singleton = _SingleRankGroupView(tp)
+omni_state._WORLD = world
+omni_state._SP = singleton
+omni_state._PP = _SingleRankGroupView(pp)
+omni_state._CFG = singleton
+omni_state._DP = singleton
+omni_state._FS = singleton
+omni_state._HSDP_REPLICATE = singleton
+```
+
+关闭时 `_restore_omni_group_views()` 恢复原模块变量，但不销毁 vLLM 拥有的 process group。这也是当前实现明确限制为单 rank 的原因；多卡版本不能只删除检查，而需要 model-scoped topology registry。
+
+### 9.5 Memory provider 跨仓库调用链
+
+```text
+EmbeddedOmniDiffusionRunner._memory_pool_context(tag)
+  → DiffusionModelRunner.load_model(memory_pool_context_fn=...)
+      ├─ weights
+      ├─ pipeline._cache_memory_pool_context_fn
+      └─ DiT._cache_memory_pool_context_fn
+          ├─ SeaCache retained clone → sea_cache
+          └─ Cosmos3 retained UND K/V/freq → und_cache
+```
+
+vLLM Adapter 决定创建还是复用 tagged pool：
+
+```python
+if tag in self._memory_pool_tags:
+    context = self.memory_allocator.reuse_memory_pool(tag)
+else:
+    context = self.memory_allocator.use_memory_pool(tag=tag)
+with context:
+    self._memory_pool_tags.add(tag)
+    yield
+```
+
+`reuse_memory_pool()` 位于 `vllm/device_allocator/cumem.py`：
+
+```python
+@contextmanager
+def reuse_memory_pool(self, tag: str):
+    data = self.pointer_to_data[tag]
+    old_tag = self.current_tag
+    self.current_tag = tag
+    try:
+        with _reuse_memory_pool(data):
+            yield
+    finally:
+        self.current_tag = old_tag
+```
+
+Omni patch 位于另一个仓库。`DiffusionModelRunner.load_model()` 只接受抽象 context factory：
+
+```python
+def get_memory_context():
+    if memory_pool_context_fn is not None:
+        return memory_pool_context_fn("weights")
+    return nullcontext()
+
+with get_memory_context():
+    self.pipeline = model_loader.load_model(...)
+
+self.pipeline._cache_memory_pool_context_fn = memory_pool_context_fn
+for module_name in self.pipeline._dit_modules:
+    module._cache_memory_pool_context_fn = memory_pool_context_fn
+```
+
+SeaCache 只把最终长期保留的 clone 放进 pool，而不是包围整个 forward：
+
+```python
+with self._cache_memory_context():
+    indicator.append(filtered.clone())
+with self._cache_memory_context():
+    cached_residual = residual.clone()
+```
+
+UND cache 在 `transformer_cosmos3.py::_retain_und_cache()` 中遵循同样规则；没有 provider 时保留 Omni 原行为，有 provider 时才在 `und_cache` tag 中 clone K/V 和频率 tensor。
+
+### 9.6 Stream/Event 契约
+
+入口：`EmbeddedOmniDiffusionRunner.execute_model()`
+
+```python
+caller = torch.cuda.current_stream(self.device)
+stream.wait_stream(caller)
+with torch.cuda.stream(stream):
+    actual = torch.cuda.current_stream(self.device)
+    self._last_execution_stream_handle = int(actual.cuda_stream)
+    output = self.runner.execute_model(request)
+    completion = torch.cuda.Event()
+    completion.record(stream)
+caller.wait_event(completion)
+```
+
+数据依赖是：调用者已提交工作 → Generator stream 等待 caller → Generator 执行并记录 event → caller 等待 completion。这里避免 device-wide synchronize。`stream_control_stats()` 比较 expected/actual handle，用来发现底层逃回其他 stream。
+
+普通并发由 Adapter 创建 stream：
+
+```python
+embedded.create_execution_stream()
+```
+
+GC 场景由 runtime 注入 external stream：
+
+```python
+generator_stream = torch.cuda.ExternalStream(gc_pair.first_stream_ptr)
+embedded.set_execution_stream(generator_stream)
+```
+
+### 9.7 为什么 `GreenContextPair` 必须来自同一次 split
+
+文件：`vllm/experimental/green_context.py`
+
+```python
+cuDeviceGetDevResource(device, available, CU_DEV_RESOURCE_TYPE_SM)
+cuDevSmResourceSplitByCount(
+    first_resource,
+    group_count,
+    available,
+    second_resource,  # 同一次调用返回 remainder
+    flags,
+    requested_first_sm_count,
+)
+```
+
+随后对 requested resource 和 remainder 分别创建 descriptor、GC 和 stream。两个独立的 `GreenContextStream` 都从完整设备请求资源，不能提供非重叠证明；`GreenContextPair` 的互斥性来自同一次 split。
+
+当前 descriptor 只含 SM resource。CUDA 13.2 的 balanced workqueue 支持应在这里扩展 resource descriptor，不需要改变 Adapter 的 `set_execution_stream()` API。
+
+### 9.8 CUDA Graph 为什么 patch 三类入口
+
+文件：`vllm/experimental/runtime_stream_patch.py`
+
+vLLM 多个模块 by-value import 了 `graph_capture`：
+
+```python
+for owner in (parallel_state, gpu_model_runner, cudagraph_utils):
+    owner.graph_capture = graph_capture_on_external_stream
+```
+
+Graph manager 又会自行选择 capture stream：
+
+```python
+ModelCudaGraphManager._capture_stream = capture_stream_on_external_green_context
+```
+
+compiled graph 路径还会独立查询 current stream：
+
+```python
+compilation_cuda_graph.current_stream = (
+    compiled_capture_stream_on_external_green_context
+)
+```
+
+所以外层 `with torch.cuda.stream(reasoner_gc_stream)` 仍不足够。`graph_capture_calls`、`manager_capture_stream_calls` 和 `compiled_capture_stream_calls` 三个计数器用于证明 capture 确实经过补丁。`restore()` 会按反向顺序还原符号，并检测安装后是否又被修改。
+
+### 9.9 各 Gate 对应的代码问题
+
+| Gate | 文件 | 阅读重点 |
+|---|---|---|
+| 配置 | `omni_runner_config_gate.py` | 官方 resolver 最小输出 |
+| 串行双模型 | `omni_runner_dual_model_gate.py` | 同 PID/context、初始化与关闭顺序 |
+| full-SM 并发 | `omni_runner_concurrent_gate.py` | dedicated stream、host thread、serial/concurrent wall |
+| 互斥 GC | `omni_runner_gc_concurrent_gate.py` | `GreenContextPair`、external stream、graph recapture、三类基线 |
+| 组件影响 | `omni_runner_component_colocation.py` | decode hook、`diffuse`/`_decode_latents` hook、coverage 验证 |
+
+组件 Gate 没有复制 Pipeline，只临时 hook 原方法。重点搜索：
+
+```text
+decode_region_hook
+generator_region_hook
+Region.enter / Region.leave
+requested_coverage_verified
+```
+
+### 9.10 推荐阅读顺序和检索命令
+
+推荐顺序：
+
+1. `omni_runner_config_gate.py`；
+2. `omni_runner_dual_model_gate.py::main()`；
+3. Adapter 的 `resolve_omni_diffusion_stage()`；
+4. Adapter 的 `start()` / `close()`；
+5. `_SingleRankGroupView` / `_install_omni_group_views()`；
+6. `_memory_pool_context()`，然后跨仓库阅读 Omni memory patch；
+7. `execute_model()` / `stream_control_stats()`；
+8. `GreenContextPair`；
+9. `install_vllm_graph_capture_stream_patch()`；
+10. 最后阅读并发和组件 Gate 的测量代码。
+
+```bash
+cd /data/cjh/cosmos3-workspace/vllm-single-framework
+rg -n "^(class|def) " vllm/experimental/*.py
+rg -n "EmbeddedOmniDiffusionRunner|GreenContextPair|install_vllm_graph" \
+  examples/offline_inference/*.py
+
+git show fd783be9ce -- \
+  vllm/experimental \
+  vllm/device_allocator/cumem.py
+```
+
+跨仓库查看 Omni patch：
+
+```bash
+cd /data/cjh/cosmos3-workspace/vllm-omni
+
+git show 4fdf39e15 -- \
+  vllm_omni/diffusion/worker/diffusion_model_runner.py \
+  vllm_omni/diffusion/cache/seacache \
+  vllm_omni/diffusion/models/cosmos3/transformer_cosmos3.py
+```
