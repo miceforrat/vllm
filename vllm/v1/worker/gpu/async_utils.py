@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import threading
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -112,6 +114,73 @@ class StepTimingCollector:
             self._step = None
 
 
+@dataclass(frozen=True)
+class AsyncOutputEventSlot:
+    """Two reusable events for one in-flight asynchronous output copy."""
+
+    handoff_event: torch.cuda.Event
+    copy_done_event: torch.cuda.Event
+
+
+class AsyncOutputEventPool:
+    """Bounded pool of CUDA events used by :class:`AsyncOutput`.
+
+    A slot is leased until the associated D2H copy has completed. Re-recording
+    either event before then would change the synchronization target observed by
+    an older ``AsyncOutput``, so acquisition deliberately applies backpressure
+    when all slots are in flight.
+    """
+
+    def __init__(self, size: int):
+        if size <= 0:
+            raise ValueError(
+                f"Async output event pool size must be positive, got {size}"
+            )
+        self._available = deque(
+            AsyncOutputEventSlot(
+                handoff_event=torch.cuda.Event(),
+                copy_done_event=torch.cuda.Event(blocking=True),
+            )
+            for _ in range(size)
+        )
+        self._condition = threading.Condition()
+        self._size = size
+        self._in_use = 0
+        self._high_watermark = 0
+        self._wait_count = 0
+        self._miss_count = 0
+
+    def acquire(self, *, block: bool = True) -> AsyncOutputEventSlot | None:
+        with self._condition:
+            if not self._available:
+                if not block:
+                    self._miss_count += 1
+                    return None
+                self._wait_count += 1
+            while not self._available:
+                self._condition.wait()
+            slot = self._available.popleft()
+            self._in_use += 1
+            self._high_watermark = max(self._high_watermark, self._in_use)
+            return slot
+
+    def release(self, slot: AsyncOutputEventSlot) -> None:
+        with self._condition:
+            self._available.append(slot)
+            self._in_use -= 1
+            self._condition.notify()
+
+    def stats(self) -> dict[str, int]:
+        with self._condition:
+            return {
+                "size": self._size,
+                "in_use": self._in_use,
+                "high_watermark": self._high_watermark,
+                "wait_count": self._wait_count,
+                "miss_count": self._miss_count,
+            }
+
+
 class AsyncOutput(AsyncModelRunnerOutput):
     def __init__(
         self,
@@ -122,6 +191,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool,
         pending_aux_output: "PendingAuxOutput | None",
+        event_pool: AsyncOutputEventPool | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -130,48 +200,86 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.cuda.Event(blocking=True)
+        self._event_pool = event_pool
+        # Blocking here can deadlock async scheduling: the output holding the
+        # last slot may only be consumed after this Worker RPC returns. Fall
+        # back to the legacy one-shot events when a deliberately undersized
+        # pool is exhausted; a correctly sized pool should report zero misses.
+        self._event_slot = (
+            event_pool.acquire(block=False) if event_pool is not None else None
+        )
+        # Blocking (sleep) event avoids busy-polling the CUDA driver lock. The
+        # legacy path intentionally remains unchanged when pooling is disabled.
+        self.copy_event = (
+            self._event_slot.copy_done_event
+            if self._event_slot is not None
+            else torch.cuda.Event(blocking=True)
+        )
         self._has_fault: torch.Tensor | None = None
 
-        with stream(copy_stream, main_stream):
-            copy_stream.wait_stream(main_stream)
+        try:
+            with stream(copy_stream, main_stream):
+                if self._event_slot is None:
+                    copy_stream.wait_stream(main_stream)
+                else:
+                    # Avoid Stream.wait_stream(), which creates a fresh
+                    # temporary CUDA event for every output.
+                    self._event_slot.handoff_event.record(main_stream)
+                    copy_stream.wait_event(self._event_slot.handoff_event)
 
-            self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
-            self.logprobs_tensors: LogprobsTensors | None = None
-            if sampler_output.logprobs_tensors is not None:
-                self.logprobs_tensors = (
-                    sampler_output.logprobs_tensors.to_cpu_nonblocking()
+                self.sampled_token_ids = async_copy_to_np(
+                    sampler_output.sampled_token_ids
                 )
-            self.num_nans: np.ndarray | None = None
-            if sampler_output.num_nans is not None:
-                self.num_nans = async_copy_to_np(sampler_output.num_nans)
-            self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
-            self.sampling_mask_tensors: SamplingMaskTensors | None = None
-            if sampler_output.sampling_mask_tensors is not None:
-                self.sampling_mask_tensors = (
-                    sampler_output.sampling_mask_tensors.to_cpu_nonblocking()
+                self.logprobs_tensors: LogprobsTensors | None = None
+                if sampler_output.logprobs_tensors is not None:
+                    self.logprobs_tensors = (
+                        sampler_output.logprobs_tensors.to_cpu_nonblocking()
+                    )
+                self.num_nans: np.ndarray | None = None
+                if sampler_output.num_nans is not None:
+                    self.num_nans = async_copy_to_np(sampler_output.num_nans)
+                self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+                self.sampling_mask_tensors: SamplingMaskTensors | None = None
+                if sampler_output.sampling_mask_tensors is not None:
+                    self.sampling_mask_tensors = (
+                        sampler_output.sampling_mask_tensors.to_cpu_nonblocking()
+                    )
+                self.prompt_logprobs_dict = {
+                    k: v.to_cpu_nonblocking() if v is not None else None
+                    for k, v in self.model_runner_output.prompt_logprobs_dict.items()
+                }
+                token_id_logprobs = (
+                    self.model_runner_output.prompt_token_id_logprobs_dict
                 )
-            self.prompt_logprobs_dict = {
-                k: v.to_cpu_nonblocking() if v is not None else None
-                for k, v in self.model_runner_output.prompt_logprobs_dict.items()
-            }
-            token_id_logprobs = self.model_runner_output.prompt_token_id_logprobs_dict
-            self.prompt_token_id_logprobs_dict = {
-                k: v.to("cpu", non_blocking=True) for k, v in token_id_logprobs.items()
-            }
-            if self.pending_aux_output is not None:
-                self.pending_aux_output.enqueue_cpu_copy(
-                    num_sampled=self.num_sampled_tokens_np,
-                    num_rejected=async_copy_to_np(sampler_output.num_rejected),
-                )
-            if check_ep_fault:
-                has_fault = get_ep_all2all_manager().query_fault()
-                self._has_fault = has_fault.to("cpu", non_blocking=True)
-            self.copy_event.record(copy_stream)
+                self.prompt_token_id_logprobs_dict = {
+                    k: v.to("cpu", non_blocking=True)
+                    for k, v in token_id_logprobs.items()
+                }
+                if self.pending_aux_output is not None:
+                    self.pending_aux_output.enqueue_cpu_copy(
+                        num_sampled=self.num_sampled_tokens_np,
+                        num_rejected=async_copy_to_np(sampler_output.num_rejected),
+                    )
+                if check_ep_fault:
+                    has_fault = get_ep_all2all_manager().query_fault()
+                    self._has_fault = has_fault.to("cpu", non_blocking=True)
+                self.copy_event.record(copy_stream)
+        except BaseException:
+            if self._event_slot is not None:
+                # Do not make a slot containing unfinished work reusable.
+                copy_stream.synchronize()
+                self._event_pool.release(self._event_slot)
+                self._event_slot = None
+            raise
 
     def get_output(self) -> ModelRunnerOutput:
-        self.copy_event.synchronize()
+        try:
+            self.copy_event.synchronize()
+        finally:
+            if self._event_slot is not None:
+                assert self._event_pool is not None
+                self._event_pool.release(self._event_slot)
+                self._event_slot = None
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.

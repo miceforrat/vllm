@@ -7,6 +7,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import functools
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -186,12 +187,17 @@ def run_reasoner_benchmark(
             use_tqdm=False,
         )
     candidate = outputs[0].outputs[0]
+    token_ids = list(candidate.token_ids)
     return {
         "seconds": time.perf_counter() - started,
         "prompt_tokens": len(prompt_ids),
-        "completion_tokens": len(candidate.token_ids),
+        "completion_tokens": len(token_ids),
         "finish_reason": candidate.finish_reason,
         "fixed_tokens": fixed_tokens,
+        "token_ids_sha256": hashlib.sha256(
+            json.dumps(token_ids, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "text_sha256": hashlib.sha256(candidate.text.encode()).hexdigest(),
     }
 
 
@@ -256,6 +262,14 @@ def main() -> None:
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--alone-repeats", type=int, default=1)
     parser.add_argument("--concurrent-repeats", type=int, default=1)
+    parser.add_argument(
+        "--cuda-profiler-capture-concurrent",
+        action="store_true",
+        help=(
+            "Bracket the first concurrent repetition with cudaProfilerStart/Stop "
+            "for Nsight Systems --capture-range=cudaProfilerApi."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -351,21 +365,34 @@ def main() -> None:
     concurrent = []
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="component-gate") as pool:
         for i in range(args.concurrent_repeats):
-            barrier = threading.Barrier(2)
-            rf = pool.submit(
-                measured_decode, reasoner, prompt, max_tokens, decode_stream, barrier,
-                args.reasoner_fixed_tokens,
-            )
-            gf = pool.submit(
-                measured_component,
-                embedded,
-                workload,
-                args.component,
-                f"component-concurrent-{i}",
-                barrier,
-            )
-            rr, rd = rf.result()
-            gr, gd = gf.result()
+            capture = args.cuda_profiler_capture_concurrent and i == 0
+            if capture:
+                torch.cuda.profiler.start()
+            try:
+                with torch.cuda.nvtx.range(f"component.concurrent.{i}"):
+                    barrier = threading.Barrier(2)
+                    rf = pool.submit(
+                        measured_decode,
+                        reasoner,
+                        prompt,
+                        max_tokens,
+                        decode_stream,
+                        barrier,
+                        args.reasoner_fixed_tokens,
+                    )
+                    gf = pool.submit(
+                        measured_component,
+                        embedded,
+                        workload,
+                        args.component,
+                        f"component-concurrent-{i}",
+                        barrier,
+                    )
+                    rr, rd = rf.result()
+                    gr, gd = gf.result()
+            finally:
+                if capture:
+                    torch.cuda.profiler.stop()
             overlap = max(
                 0.0,
                 min(rd["host_end"], gd["host_end"])
@@ -397,6 +424,18 @@ def main() -> None:
         for r in concurrent
     ) == 1.0
     expected_coverage = decode_covers if args.coverage == "decode_covers_component" else component_covers
+    reasoner_requests = [row["reasoner"] for row in warmups]
+    reasoner_requests.extend(row["decode"]["request"] for row in alone)
+    reasoner_requests.extend(row["decode"]["request"] for row in concurrent)
+    token_hashes = {row["token_ids_sha256"] for row in reasoner_requests}
+    text_hashes = {row["text_sha256"] for row in reasoner_requests}
+    completion_lengths = {row["completion_tokens"] for row in reasoner_requests}
+    output_consistent = (
+        len(token_hashes) == len(text_hashes) == len(completion_lengths) == 1
+    )
+    model_runner = reasoner_model_runner(reasoner)
+    event_pool = getattr(model_runner, "async_output_event_pool", None)
+    event_pool_stats = None if event_pool is None else event_pool.stats()
     summary = {
         "decode_partitioned_alone_seconds": decode_alone,
         "component_partitioned_alone_seconds": component_alone,
@@ -408,6 +447,16 @@ def main() -> None:
         "component_covers_decode": component_covers,
         "requested_coverage_verified": expected_coverage,
         "overlap_seconds": statistics.median(r["overlap_seconds"] for r in concurrent),
+        "reasoner_output_consistent": output_consistent,
+        "reasoner_distinct_token_hashes": len(token_hashes),
+        "reasoner_distinct_text_hashes": len(text_hashes),
+        "reasoner_distinct_completion_lengths": len(completion_lengths),
+        "async_output_event_pool_drained": (
+            event_pool_stats is None or event_pool_stats["in_use"] == 0
+        ),
+        "async_output_event_pool_no_misses": (
+            event_pool_stats is None or event_pool_stats["miss_count"] == 0
+        ),
     }
     report = {
         "experiment": "llm_decode_x_generator_component",
@@ -422,6 +471,7 @@ def main() -> None:
         "reasoner_mode": args.reasoner_mode,
         "generator_mode": "regional_compile",
         "generator_cache": args.generator_cache,
+        "async_output_event_pool": event_pool_stats,
         "workload": {
             "reasoner_input": str(args.reasoner_input),
             "reasoner_max_tokens": max_tokens,

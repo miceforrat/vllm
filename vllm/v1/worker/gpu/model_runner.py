@@ -84,6 +84,7 @@ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
+    AsyncOutputEventPool,
     AsyncPoolingOutput,
     StepTimingCollector,
 )
@@ -223,6 +224,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.is_first_pp_rank = get_pp_group().is_first_rank
         self.is_last_pp_rank = get_pp_group().is_last_rank
+        event_pool_size = envs.VLLM_ASYNC_OUTPUT_EVENT_POOL_SIZE
+        self.async_output_event_pool = (
+            AsyncOutputEventPool(event_pool_size)
+            if self.is_last_pp_rank and event_pool_size > 0
+            else None
+        )
+        if self.async_output_event_pool is not None:
+            logger.info(
+                "Enabled async-output CUDA event pool with %d slots",
+                event_pool_size,
+            )
 
         # Size the UVA buffer pools to the max number of concurrent in-flight
         # steps. Must run before any pooled buffer is constructed
@@ -2148,6 +2160,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
+            event_pool=self.async_output_event_pool,
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
