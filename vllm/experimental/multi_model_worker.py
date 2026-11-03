@@ -188,6 +188,14 @@ class MultiModelWorkerExtension:
             )
             if execution_stream is not None:
                 adapter.set_execution_stream(execution_stream)
+            phase_selector = (
+                getattr(self, "acquire_generator_phase_lease", None)
+                if getattr(self, "_multi_model_resource_arbiter", None)
+                is not None
+                else None
+            )
+            if phase_selector is not None:
+                adapter.set_generator_phase_stream_selector(phase_selector)
         except Exception:
             adapter.close()
             if tp_group is not None:
@@ -238,6 +246,8 @@ class MultiModelWorkerExtension:
             "host_start": host_start,
             "host_end": host_end,
             "seconds": host_end - host_start,
+            "worker_thread_ident": threading.get_ident(),
+            "worker_thread_name": threading.current_thread().name,
         }
 
     def _auxiliary_thread_pool(self) -> ThreadPoolExecutor:
@@ -674,6 +684,9 @@ class WorkerHostedRunnerClient:
     def resource_plan(self) -> list[dict[str, Any]]:
         return self._rpc("multi_model_resource_plan")
 
+    def set_primary_demand(self, active: bool) -> list[dict[str, Any]]:
+        return self._rpc("set_primary_model_demand", active)
+
     def close(self) -> list[list[str]]:
         return self._rpc("close_auxiliary_runners")
 
@@ -825,6 +838,11 @@ class AsyncWorkerHostedRunnerClient(WorkerHostedRunnerClient):
 
     async def resource_plan(self) -> list[dict[str, Any]]:
         return await self._rpc_async("multi_model_resource_plan")
+
+    async def set_primary_demand(
+        self, active: bool
+    ) -> list[dict[str, Any]]:
+        return await self._rpc_async("set_primary_model_demand", active)
 
     async def close(self) -> list[list[str]]:
         return await self._rpc_async("close_auxiliary_runners")

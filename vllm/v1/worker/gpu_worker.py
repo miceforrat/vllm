@@ -878,9 +878,42 @@ class Worker(WorkerBase):
                 )
 
         cuda_graph_memory_bytes = 0
+        cuda_graph_capture_seconds = 0.0
+        cuda_graph_allocated_delta_bytes = 0
+        cuda_graph_reserved_delta_bytes = 0
         if not self.model_config.enforce_eager:
+            torch.accelerator.synchronize()
+            cuda_graph_allocated_before = int(
+                torch.cuda.memory_allocated(self.device)
+            )
+            cuda_graph_reserved_before = int(
+                torch.cuda.memory_reserved(self.device)
+            )
+            cuda_graph_capture_started = time.perf_counter()
             with self._get_cudagraph_capture_context():
                 cuda_graph_memory_bytes = self.model_runner.capture_model()
+            cuda_graph_capture_seconds = (
+                time.perf_counter() - cuda_graph_capture_started
+            )
+            torch.accelerator.synchronize()
+            cuda_graph_allocated_delta_bytes = int(
+                torch.cuda.memory_allocated(self.device)
+            ) - cuda_graph_allocated_before
+            cuda_graph_reserved_delta_bytes = int(
+                torch.cuda.memory_reserved(self.device)
+            ) - cuda_graph_reserved_before
+        # Retain the measured live-capture footprint for runtime extensions
+        # that add further graph registries after the primary vLLM capture.
+        # This is observational only; the value already participates in the
+        # memory accounting below.
+        self.cuda_graph_memory_bytes = int(cuda_graph_memory_bytes)
+        self.cuda_graph_capture_seconds = float(cuda_graph_capture_seconds)
+        self.cuda_graph_allocated_delta_bytes = int(
+            cuda_graph_allocated_delta_bytes
+        )
+        self.cuda_graph_reserved_delta_bytes = int(
+            cuda_graph_reserved_delta_bytes
+        )
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (

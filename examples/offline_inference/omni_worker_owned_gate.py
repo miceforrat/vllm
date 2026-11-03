@@ -113,7 +113,7 @@ def _describe_memory_profile(profile: Any) -> dict[str, Any]:
     )
 
 
-def _run_concurrent_once(
+def _run_concurrent_once_impl(
     *,
     reasoner: Any,
     client: Any,
@@ -187,6 +187,13 @@ def _run_concurrent_once(
             args.reasoner_arrival_delay_seconds
         ),
     }
+
+
+def _run_concurrent_once(**kwargs: Any) -> dict[str, Any]:
+    """Run one colocated request inside an Nsys-selectable NVTX range."""
+    index = int(kwargs["index"])
+    with torch.cuda.nvtx.range(f"worker.concurrent.request.{index}"):
+        return _run_concurrent_once_impl(**kwargs)
 
 
 def _load_full_sm_reference(
@@ -382,6 +389,39 @@ def main() -> None:
     )
     parser.add_argument("--generator-sm-count", type=int, default=120)
     parser.add_argument(
+        "--trace-partition-nvtx",
+        action="store_true",
+        help=(
+            "Emit Reasoner batch and Generator phase/mode NVTX annotations "
+            "for partition-placement verification."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-step-scheduling",
+        action="store_true",
+        help=(
+            "Expose preparing, denoising-step, VAE and complete boundaries "
+            "to the Worker resource arbiter."
+        ),
+    )
+    parser.add_argument(
+        "--generator-phase-policy",
+        choices=("demand_aware", "fixed_shared"),
+        default="demand_aware",
+        help=(
+            "Use demand-aware lane selection, or keep every phase on the "
+            "partitioned Generator stream to isolate slicing overhead."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-reasoner-stream",
+        action="store_true",
+        help=(
+            "Allow eager Reasoner scheduler batches to use a full-SM stream "
+            "outside shared Generator phases."
+        ),
+    )
+    parser.add_argument(
         "--full-sm-reference",
         type=Path,
         help=(
@@ -478,7 +518,21 @@ def main() -> None:
             "additional_config": {
                 "multi_model_runtime": {
                     "green_context": {
-                        "generator_sm_count": args.generator_sm_count
+                        "generator_sm_count": args.generator_sm_count,
+                        "dynamic_step_scheduling": (
+                            args.dynamic_step_scheduling
+                        ),
+                        "generator_phase_policy": (
+                            args.generator_phase_policy
+                        ),
+                        "dynamic_reasoner_stream": (
+                            args.dynamic_reasoner_stream
+                        ),
+                        "dual_reasoner_graph_variants": (
+                            args.dynamic_reasoner_stream
+                            and args.reasoner_mode == "graph"
+                        ),
+                        "trace_partition_nvtx": args.trace_partition_nvtx,
                     }
                 }
             },
@@ -691,6 +745,10 @@ def main() -> None:
             )
 
         metadata = client.metadata(args.model_id)
+        if args.generator_stream == "green":
+            # Refresh after all requests so phase/epoch counters in the report
+            # describe executed work rather than the just-initialized runtime.
+            stream = client.resource_plan()
         resource_contract = _verify_resource_contract(
             stream,
             metadata,

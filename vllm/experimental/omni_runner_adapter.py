@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import os
+import types
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, fields
 from typing import Any, Mapping
@@ -145,6 +146,12 @@ def resolve_omni_diffusion_stage(
 class EmbeddedOmniDiffusionRunner:
     """Run Omni's original runner on vLLM-owned infrastructure."""
 
+    # Wan decodes one latent-time chunk by running the complete decoder.  A
+    # 121-frame Cosmos3 request has 31 such calls.  Grouping eight calls keeps
+    # VAE admission latency bounded without turning every decoder module into
+    # a scheduling boundary.
+    _VAE_DECODER_CALLS_PER_SEGMENT = 8
+
     def __init__(
         self,
         resolved: ResolvedOmniDiffusionStage,
@@ -171,6 +178,22 @@ class EmbeddedOmniDiffusionRunner:
         self._worker_hosted = False
         self._parallel_topology: dict[str, Any] | None = None
         self._auxiliary_tp_group: Any | None = None
+        self._step_stream_selector: Any | None = None
+        self._active_step_lease: Any | None = None
+        self._step_stream: torch.cuda.Stream | None = None
+        self._phase_stream_context: Any | None = None
+        self._step_hook_pipeline: Any | None = None
+        self._step_sequence_started = False
+        self._original_set_step_metadata: Any | None = None
+        self._original_clear_step_metadata: Any | None = None
+        self._original_decode_latents: Any | None = None
+        self._vae_decoder_hook: Any | None = None
+        self._vae_decode_active = False
+        self._vae_decoder_calls = 0
+        self._vae_segment_index = 0
+        self._step_mode_counts: dict[str, int] = {}
+        self._phase_counts: dict[str, int] = {}
+        self._active_phase_nvtx = False
 
     @contextmanager
     def _memory_pool_context(self, tag: str) -> Any:
@@ -302,7 +325,227 @@ class EmbeddedOmniDiffusionRunner:
                     "actual_sm_count": self._green_context_owner.actual_sm_count,
                 }
             ),
+            "step_scheduling": {
+                "enabled": self._step_stream_selector is not None,
+                "mode_counts": dict(self._step_mode_counts),
+                "phase_counts": dict(self._phase_counts),
+            },
         }
+
+    def set_generator_phase_stream_selector(self, selector: Any) -> None:
+        """Install phase scheduling without replacing Omni's pipeline.
+
+        Cosmos3 already calls ``_set_denoise_step_metadata`` once at every
+        diffusion-step boundary, and enters ``_decode_latents`` for the final
+        VAE phase. Wrapping those original pipeline boundaries exposes
+        PREPARING, each DENOISING step, and the whole VAE decode as scheduling
+        units while preserving Omni's caches, solver, and optimized kernels.
+        """
+        if self.runner is None:
+            raise RuntimeError("Embedded Omni runner is not started")
+        if self._step_stream_selector is not None:
+            raise RuntimeError(
+                "A diffusion-step stream selector is already installed"
+            )
+        pipeline = self.runner.pipeline
+        set_step = getattr(pipeline, "_set_denoise_step_metadata", None)
+        clear_step = getattr(pipeline, "_clear_denoise_step_metadata", None)
+        decode_latents = getattr(pipeline, "_decode_latents", None)
+        if (
+            not callable(set_step)
+            or not callable(clear_step)
+            or not callable(decode_latents)
+        ):
+            raise RuntimeError(
+                "The Omni pipeline does not expose denoising and VAE boundaries"
+            )
+        self._step_stream_selector = selector
+        self._step_hook_pipeline = pipeline
+        self._original_set_step_metadata = set_step
+        self._original_clear_step_metadata = clear_step
+        self._original_decode_latents = decode_latents
+
+        vae = getattr(pipeline, "vae", None)
+        decoder = getattr(vae, "decoder", None)
+        if isinstance(decoder, torch.nn.Module):
+            self._vae_decoder_hook = decoder.register_forward_pre_hook(
+                self._before_vae_decoder_call
+            )
+
+        def scheduled_set_step(
+            pipeline_self: Any, step_index: int, *args: Any, **kwargs: Any
+        ) -> Any:
+            del pipeline_self
+            self._finish_scheduled_phase()
+            if not self._step_sequence_started:
+                self._step_sequence_started = True
+            self._begin_scheduled_phase("denoising", int(step_index))
+            return self._original_set_step_metadata(step_index, *args, **kwargs)
+
+        def scheduled_clear_step(
+            pipeline_self: Any, *args: Any, **kwargs: Any
+        ) -> Any:
+            del pipeline_self
+            self._finish_scheduled_phase()
+            self._step_sequence_started = False
+            return self._original_clear_step_metadata(*args, **kwargs)
+
+        def scheduled_decode_latents(
+            pipeline_self: Any, *args: Any, **kwargs: Any
+        ) -> Any:
+            del pipeline_self
+            self._vae_decode_active = True
+            self._vae_decoder_calls = 0
+            self._vae_segment_index = 0
+            self._begin_scheduled_phase("vae", self._vae_segment_index)
+            try:
+                return self._original_decode_latents(*args, **kwargs)
+            finally:
+                try:
+                    self._finish_scheduled_phase()
+                finally:
+                    self._vae_decode_active = False
+
+        pipeline._set_denoise_step_metadata = types.MethodType(
+            scheduled_set_step, pipeline
+        )
+        pipeline._clear_denoise_step_metadata = types.MethodType(
+            scheduled_clear_step, pipeline
+        )
+        pipeline._decode_latents = types.MethodType(
+            scheduled_decode_latents, pipeline
+        )
+
+    def _before_vae_decoder_call(
+        self, module: Any, args: tuple[Any, ...]
+    ) -> None:
+        """Re-evaluate VAE placement every few temporal decoder calls."""
+        del module, args
+        if not self._vae_decode_active:
+            return
+        calls_per_segment = self._VAE_DECODER_CALLS_PER_SEGMENT
+        if (
+            self._vae_decoder_calls > 0
+            and self._vae_decoder_calls % calls_per_segment == 0
+        ):
+            self._finish_scheduled_phase()
+            self._vae_segment_index += 1
+            self._begin_scheduled_phase("vae", self._vae_segment_index)
+        self._vae_decoder_calls += 1
+
+    def set_diffusion_step_stream_selector(self, selector: Any) -> None:
+        """Compatibility adapter for the original step-only selector."""
+
+        def phase_selector(phase: str, step_index: int | None = None) -> Any:
+            if phase != "denoising":
+                return None
+            assert step_index is not None
+            return selector(step_index)
+
+        self.set_generator_phase_stream_selector(phase_selector)
+
+    def _begin_scheduled_phase(
+        self, phase: str, step_index: int | None = None
+    ) -> None:
+        if self._step_stream_selector is None:
+            return
+        self._finish_scheduled_phase()
+        lease = self._step_stream_selector(phase, step_index)
+        self._phase_counts[phase] = self._phase_counts.get(phase, 0) + 1
+        if lease is None:
+            return
+        # A phase owns a complete scoped stream context.  In particular, do
+        # not enter the request on a Green Context stream and then call
+        # set_stream() with a primary-context stream inside that outer guard.
+        # This mirrors SGLang P/D multiplexing: leave the previous scope at a
+        # safe boundary, then enter the selected stream for the next unit.
+        stream_context = torch.cuda.stream(lease.stream)
+        try:
+            stream_context.__enter__()
+        except BaseException:
+            lease.finish()
+            raise
+        self._active_step_lease = lease
+        self._step_stream = lease.stream
+        self._phase_stream_context = stream_context
+        self._step_mode_counts[lease.mode] = (
+            self._step_mode_counts.get(lease.mode, 0) + 1
+        )
+        step = "none" if step_index is None else str(step_index)
+        stream_handle = self._stream_handle(
+            torch.cuda.current_stream(self.device)
+        )
+        assert stream_handle is not None
+        self._last_execution_stream_handle = stream_handle
+        torch.cuda.nvtx.range_push(
+            "generator/"
+            f"{phase}/step={step}/mode={lease.mode}/"
+            f"stream=0x{stream_handle:x}"
+        )
+        self._active_phase_nvtx = True
+
+    def _finish_scheduled_phase(self) -> None:
+        lease = self._active_step_lease
+        if lease is None:
+            return
+        completion_event = None
+        try:
+            assert self._step_stream is not None
+            phase = lease.phase.value
+            step = "none" if lease.step_index is None else str(lease.step_index)
+            trace_nvtx = lease.trace_nvtx
+            if trace_nvtx:
+                torch.cuda.nvtx.mark(
+                    "generator/gpu_submit_end/"
+                    f"phase={phase}/step={step}/mode={lease.mode}"
+                )
+            # Record a stream-ordered handoff instead of synchronizing every
+            # phase on the host. Consecutive phases on the same lane inherit
+            # normal CUDA stream ordering. The arbiter waits on this event
+            # only for a shared/full ownership transition, primary admission,
+            # or final request completion.
+            completion_event = torch.cuda.Event()
+            completion_event.record(self._step_stream)
+        finally:
+            try:
+                if self._active_phase_nvtx:
+                    torch.cuda.nvtx.range_pop()
+            finally:
+                try:
+                    stream_context = self._phase_stream_context
+                    if stream_context is not None:
+                        stream_context.__exit__(None, None, None)
+                finally:
+                    self._active_phase_nvtx = False
+                    self._phase_stream_context = None
+                    lease.finish(completion_event)
+                    self._active_step_lease = None
+                    self._step_stream = None
+
+    def _finish_scheduled_step(self) -> None:
+        self._finish_scheduled_phase()
+
+    def _restore_diffusion_step_stream_selector(self) -> None:
+        self._finish_scheduled_phase()
+        hook = self._vae_decoder_hook
+        if hook is not None:
+            hook.remove()
+            self._vae_decoder_hook = None
+        self._vae_decode_active = False
+        self._vae_decoder_calls = 0
+        self._vae_segment_index = 0
+        pipeline = self._step_hook_pipeline
+        if pipeline is not None:
+            pipeline._set_denoise_step_metadata = self._original_set_step_metadata
+            pipeline._clear_denoise_step_metadata = (
+                self._original_clear_step_metadata
+            )
+            pipeline._decode_latents = self._original_decode_latents
+        self._step_stream_selector = None
+        self._step_hook_pipeline = None
+        self._original_set_step_metadata = None
+        self._original_clear_step_metadata = None
+        self._original_decode_latents = None
 
     @staticmethod
     def _restore_diffusion_request(request: Any) -> Any:
@@ -340,21 +583,53 @@ class EmbeddedOmniDiffusionRunner:
         request = self._restore_diffusion_request(request)
         with self._execution_context():
             stream = self.execution_stream
+            if self._step_stream_selector is not None:
+                # Dynamic scheduling is phase scoped.  Close work inherited
+                # from the caller before the first phase, then let every phase
+                # enter its own selected stream context.  Each phase boundary
+                # synchronizes before releasing its lease, so returning here
+                # does not require an event recorded on an outer GC stream.
+                caller = torch.cuda.current_stream(self.device)
+                caller.synchronize()
+                self._begin_scheduled_phase("preparing")
+                try:
+                    return self.runner.execute_model(request, **kwargs)
+                finally:
+                    self._finish_generator_request()
+
             if stream is None:
                 current = torch.cuda.current_stream(self.device)
                 self._last_execution_stream_handle = self._stream_handle(current)
-                return self.runner.execute_model(request, **kwargs)
+                self._begin_scheduled_phase("preparing")
+                try:
+                    return self.runner.execute_model(request, **kwargs)
+                finally:
+                    self._finish_generator_request()
 
             caller = torch.cuda.current_stream(self.device)
             stream.wait_stream(caller)
             with torch.cuda.stream(stream):
                 actual = torch.cuda.current_stream(self.device)
                 self._last_execution_stream_handle = self._stream_handle(actual)
-                output = self.runner.execute_model(request, **kwargs)
+                self._begin_scheduled_phase("preparing")
+                try:
+                    output = self.runner.execute_model(request, **kwargs)
+                finally:
+                    self._finish_generator_request()
                 completion = torch.cuda.Event()
                 completion.record(stream)
             caller.wait_event(completion)
             return output
+
+    def _finish_generator_request(self) -> None:
+        """Close the active phase and publish an explicit COMPLETE boundary."""
+        self._finish_scheduled_phase()
+        selector = self._step_stream_selector
+        if selector is not None:
+            selector("complete", None)
+            self._phase_counts["complete"] = (
+                self._phase_counts.get("complete", 0) + 1
+            )
 
     def execute_model_profiled(
         self, request: Any, **kwargs: Any
@@ -631,6 +906,7 @@ class EmbeddedOmniDiffusionRunner:
         return self.runner
 
     def close(self) -> None:
+        self._restore_diffusion_step_stream_selector()
         if self.execution_stream is not None:
             self.execution_stream.synchronize()
         self.runner = None

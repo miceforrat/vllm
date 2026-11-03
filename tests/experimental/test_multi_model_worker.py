@@ -110,6 +110,17 @@ def test_client_requests_worker_topology() -> None:
     ]
 
 
+def test_client_updates_primary_model_demand() -> None:
+    expected = [{"primary_demand": 1}, {"primary_demand": 1}]
+    engine = _FakeEngine({"set_primary_model_demand": expected})
+    client = WorkerHostedRunnerClient(engine)
+
+    result = client.set_primary_demand(True)
+
+    assert result == expected
+    assert engine.calls == [("set_primary_model_demand", (True,))]
+
+
 def test_client_selects_only_tp_output_owner() -> None:
     expected = {"output": "rank-zero"}
     engine = _FakeEngine(
