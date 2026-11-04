@@ -110,6 +110,9 @@ class BaseRenderer(ABC, Generic[_T]):
         # warmup already ran even after reset_mm_cache joined it first, and
         # avoid running warmup_mm a second time.
         self._mm_warmup_done: bool = False
+        # Monotonic timestamps used to understand overlap between frontend
+        # preprocessing warmup and EngineCore/Worker startup.
+        self.startup_timeline: dict[str, float] = {}
 
         # Thread pool executor for blocking tokenizer operations.  The
         # multimodal processor receives a deep-copied tokenizer (see #36557)
@@ -264,6 +267,7 @@ class BaseRenderer(ABC, Generic[_T]):
         # already ran.
         if self._mm_warmup_done:
             return
+        self.startup_timeline["frontend_mm_warmup_start"] = time.perf_counter()
         try:
             # prevent MM processor hangs
             with set_default_torch_num_threads(1):
@@ -284,6 +288,7 @@ class BaseRenderer(ABC, Generic[_T]):
                             mm_processor_only_cache.clear_cache()
         finally:
             self._mm_warmup_done = True
+            self.startup_timeline["frontend_mm_warmup_end"] = time.perf_counter()
 
     def start_mm_warmup_in_background(self) -> None:
         # Launch the multimodal warmup as a task on the single-worker
@@ -313,6 +318,7 @@ class BaseRenderer(ABC, Generic[_T]):
             return  # text-only model: nothing to warm up
         if self._mm_warmup_future is not None:
             return  # already launched
+        self.startup_timeline["frontend_mm_warmup_submit"] = time.perf_counter()
         self._mm_warmup_future = self._mm_executor.submit(self.warmup_mm)
 
     def _join_mm_warmup(self) -> None:

@@ -21,7 +21,7 @@ os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 import torch
 
 from vllm.experimental.multi_model_worker import (
-    ModelDeploymentSpec,
+    ModelSpec,
     WorkerHostedRunnerClient,
 )
 
@@ -397,11 +397,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--dynamic-step-scheduling",
-        action="store_true",
+        "--partition-policy",
+        choices=("static", "dynamic"),
+        default="static",
         help=(
-            "Expose preparing, denoising-step, VAE and complete boundaries "
-            "to the Worker resource arbiter."
+            "Keep both models on fixed complementary partitions, or "
+            "dynamically switch both models between shared and full-SM lanes."
         ),
     )
     parser.add_argument(
@@ -414,12 +415,19 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--dynamic-reasoner-stream",
-        action="store_true",
+        "--reasoner-graph-pool-mode",
+        choices=("isolated", "shared"),
+        default="isolated",
         help=(
-            "Allow eager Reasoner scheduler batches to use a full-SM stream "
-            "outside shared Generator phases."
+            "Keep the shared/full Reasoner CUDA Graph registries in separate "
+            "memory pools, or reuse vLLM's global graph pool."
         ),
+    )
+    parser.add_argument(
+        "--reasoner-graph-buffer-mode",
+        choices=("isolated", "shared"),
+        default="isolated",
+        help="Share persistent output buffers across Reasoner graph variants.",
     )
     parser.add_argument(
         "--full-sm-reference",
@@ -519,18 +527,19 @@ def main() -> None:
                 "multi_model_runtime": {
                     "green_context": {
                         "generator_sm_count": args.generator_sm_count,
-                        "dynamic_step_scheduling": (
-                            args.dynamic_step_scheduling
-                        ),
+                        "partition_policy": args.partition_policy,
                         "generator_phase_policy": (
                             args.generator_phase_policy
                         ),
-                        "dynamic_reasoner_stream": (
-                            args.dynamic_reasoner_stream
-                        ),
                         "dual_reasoner_graph_variants": (
-                            args.dynamic_reasoner_stream
+                            args.partition_policy == "dynamic"
                             and args.reasoner_mode == "graph"
+                        ),
+                        "reasoner_graph_pool_mode": (
+                            args.reasoner_graph_pool_mode
+                        ),
+                        "reasoner_graph_buffer_mode": (
+                            args.reasoner_graph_buffer_mode
                         ),
                         "trace_partition_nvtx": args.trace_partition_nvtx,
                     }
@@ -566,11 +575,14 @@ def main() -> None:
                 "sea_power_exp": 3.0,
             },
         }
-    spec = ModelDeploymentSpec(
+    spec = ModelSpec(
         model_id=args.model_id,
         model_path=args.model,
         backend="vllm_omni",
-        task="text_to_video" if args.num_frames > 1 else "text_to_image",
+        capabilities=("text_to_image", "text_to_video"),
+        default_task=(
+            "text_to_video" if args.num_frames > 1 else "text_to_image"
+        ),
         backend_options=cache_options,
     )
 

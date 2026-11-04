@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import queue
 import sys
+import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -580,6 +581,10 @@ class MPClient(EngineCoreClient):
         client_addresses: dict[str, Any] | None = None,
         renderer: BaseRenderer | None = None,
     ):
+        client_init_start = time.perf_counter()
+        self.startup_timeline: dict[str, float] = {
+            "engine_core_client_init_start": client_init_start
+        }
         self.vllm_config = vllm_config
         self._renderer: BaseRenderer | None = renderer
         self._effective_attention_block_sizes: set[int | None] = set()
@@ -688,6 +693,8 @@ class MPClient(EngineCoreClient):
                     # what the warmup should overlap with.
                     self._start_mm_warmup()
 
+                self.startup_timeline.update(engine_launch.startup_timeline)
+
                 self.stats_update_address = addresses.frontend_stats_publish_address
                 if coordinator is not None:
                     assert self.stats_update_address == (
@@ -727,6 +734,9 @@ class MPClient(EngineCoreClient):
             # Wait for ready messages from each engine on the input socket.
             identities = set(self.core_engines)
             sync_input_socket = zmq.Socket.shadow(self.input_socket)
+            self.startup_timeline["client_ready_response_wait_start"] = (
+                time.perf_counter()
+            )
             while identities:
                 if not sync_input_socket.poll(
                     timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms
@@ -743,6 +753,9 @@ class MPClient(EngineCoreClient):
                 identity, payload = sync_input_socket.recv_multipart()
                 identities.remove(identity)
                 self._apply_ready_response(payload)
+            self.startup_timeline["client_ready_response_wait_end"] = (
+                time.perf_counter()
+            )
 
             self.core_engine: EngineIdentity = self.core_engines[0]
             self.utility_results: dict[int, AnyFuture] = {}
@@ -751,6 +764,9 @@ class MPClient(EngineCoreClient):
             self.start_engine_core_monitor()
 
             success = True
+            self.startup_timeline["engine_core_client_init_end"] = (
+                time.perf_counter()
+            )
         finally:
             if not success:
                 self._finalizer()

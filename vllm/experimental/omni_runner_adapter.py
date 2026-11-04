@@ -13,6 +13,7 @@ from typing import Any, Mapping
 import torch
 
 
+# 保留omni官方的cfg逻辑
 @dataclass(frozen=True)
 class ResolvedOmniDiffusionStage:
     """Official Omni configuration views for one diffusion stage."""
@@ -160,37 +161,54 @@ class EmbeddedOmniDiffusionRunner:
         execution_stream: torch.cuda.Stream | None = None,
         memory_pool_tag_prefix: str | None = None,
     ):
+        # 基础对象
         self.resolved = resolved
         self.device = torch.device(device)
         self.vllm_config: Any | None = None
         self.runner: Any | None = None
+
+        # 为omni接入显存管理
         self.use_vllm_memory_pool = use_vllm_memory_pool
         self.memory_allocator: Any | None = None
         self.memory_pool_tag_prefix = memory_pool_tag_prefix
+        self._memory_pool_tags: set[str] = set()
+
+        # stream所有权管理
         self.execution_stream = execution_stream
         self._owns_execution_stream = False
         self._green_context_owner: Any | None = None
         self._last_execution_stream_handle: int | None = None
-        self._memory_pool_tags: set[str] = set()
+
+        # 生命周期管理
         self._exit_stack = ExitStack()
+
+        # omni并行调度
         self._omni_state: Any | None = None
         self._saved_omni_groups: dict[str, Any] = {}
         self._worker_hosted = False
         self._parallel_topology: dict[str, Any] | None = None
         self._auxiliary_tp_group: Any | None = None
+
+        # 动态阶段调度
         self._step_stream_selector: Any | None = None
         self._active_step_lease: Any | None = None
         self._step_stream: torch.cuda.Stream | None = None
         self._phase_stream_context: Any | None = None
+
+        # pipeline hook
         self._step_hook_pipeline: Any | None = None
         self._step_sequence_started = False
         self._original_set_step_metadata: Any | None = None
         self._original_clear_step_metadata: Any | None = None
         self._original_decode_latents: Any | None = None
+
+        # vae 分段
         self._vae_decoder_hook: Any | None = None
         self._vae_decode_active = False
         self._vae_decoder_calls = 0
         self._vae_segment_index = 0
+
+        # 观测用指标
         self._step_mode_counts: dict[str, int] = {}
         self._phase_counts: dict[str, int] = {}
         self._active_phase_nvtx = False
@@ -372,6 +390,7 @@ class EmbeddedOmniDiffusionRunner:
                 self._before_vae_decoder_call
             )
 
+        # 每个step执行
         def scheduled_set_step(
             pipeline_self: Any, step_index: int, *args: Any, **kwargs: Any
         ) -> Any:
@@ -390,6 +409,7 @@ class EmbeddedOmniDiffusionRunner:
             self._step_sequence_started = False
             return self._original_clear_step_metadata(*args, **kwargs)
 
+        # VAE粗阶段
         def scheduled_decode_latents(
             pipeline_self: Any, *args: Any, **kwargs: Any
         ) -> Any:
@@ -468,6 +488,7 @@ class EmbeddedOmniDiffusionRunner:
         self._active_step_lease = lease
         self._step_stream = lease.stream
         self._phase_stream_context = stream_context
+        # 这个只和统计相关
         self._step_mode_counts[lease.mode] = (
             self._step_mode_counts.get(lease.mode, 0) + 1
         )
@@ -504,6 +525,8 @@ class EmbeddedOmniDiffusionRunner:
             # normal CUDA stream ordering. The arbiter waits on this event
             # only for a shared/full ownership transition, primary admission,
             # or final request completion.
+            # 这里只记录事件，不同步
+            # 除非发生需要切换的情况，才由仲裁器进行仲裁
             completion_event = torch.cuda.Event()
             completion_event.record(self._step_stream)
         finally:

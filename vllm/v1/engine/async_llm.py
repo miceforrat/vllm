@@ -122,6 +122,9 @@ class AsyncLLM(EngineClient):
             None
 
         """
+        startup_timeline: dict[str, float] = {
+            "async_llm_init_start": time.perf_counter()
+        }
         configure_logging_if_needed(vllm_config.logging_config)
 
         # Ensure we can serialize custom transformer configs
@@ -151,10 +154,14 @@ class AsyncLLM(EngineClient):
                 "enabling logging without default stat loggers."
             )
 
+        startup_timeline["renderer_init_start"] = time.perf_counter()
         self.renderer = renderer = renderer_from_config(self.vllm_config)
+        startup_timeline["renderer_init_end"] = time.perf_counter()
 
         # Convert EngineInput --> EngineCoreRequest.
+        startup_timeline["input_processor_init_start"] = time.perf_counter()
         self.input_processor = InputProcessor(self.vllm_config, renderer)
+        startup_timeline["input_processor_init_end"] = time.perf_counter()
 
         self.admission_stats = (
             SharedAdmissionStats(client_addresses, client_count, client_index)
@@ -164,6 +171,7 @@ class AsyncLLM(EngineClient):
         )
 
         # Converts EngineCoreOutputs --> RequestOutput.
+        startup_timeline["output_processor_init_start"] = time.perf_counter()
         self.output_processor = OutputProcessor(
             renderer.tokenizer,
             log_stats=self.log_stats,
@@ -171,12 +179,14 @@ class AsyncLLM(EngineClient):
             tracing_enabled=tracing_endpoint is not None,
             admission_stats=self.admission_stats,
         )
+        startup_timeline["output_processor_init_end"] = time.perf_counter()
 
         # EngineCore (starts the engine in background process).
         # Hand the renderer to the client so it can start the frontend MM
         # warmup only after engine-core fork (the why is in
         # BaseRenderer.start_mm_warmup_in_background). The warmup is joined
         # by reset_mm_cache / warmup / shutdown.
+        startup_timeline["engine_core_client_start"] = time.perf_counter()
         self.engine_core = EngineCoreClient.make_async_mp_client(
             vllm_config=vllm_config,
             executor_class=executor_class,
@@ -186,6 +196,12 @@ class AsyncLLM(EngineClient):
             client_index=client_index,
             renderer=renderer,
         )
+        startup_timeline["engine_core_client_end"] = time.perf_counter()
+        startup_timeline.update(
+            getattr(self.engine_core, "startup_timeline", {})
+        )
+        startup_timeline["async_llm_init_end"] = time.perf_counter()
+        self.startup_timeline = startup_timeline
 
         # Loggers.
         self.logger_manager: StatLoggerManager | None = None

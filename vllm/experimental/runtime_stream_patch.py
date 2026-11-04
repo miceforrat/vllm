@@ -50,7 +50,7 @@ class GraphCaptureStreamPatch:
             "compiled_capture_stream_calls": self.compiled_capture_stream_calls,
         }
 
-
+# 这个函数负责patch vllm的graph capture，从而让我们的stream接管graph capture & replay流程
 def install_vllm_graph_capture_stream_patch(
     stream: torch.cuda.Stream,
 ) -> GraphCaptureStreamPatch:

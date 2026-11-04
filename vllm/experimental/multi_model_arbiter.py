@@ -30,6 +30,7 @@ class GeneratorPhaseLease:
 
     def finish(self, completion_event: Any | None = None) -> None:
         if not self._finished:
+            # 由仲裁器来托管最后的finish
             self._arbiter.finish_generator_phase(self, completion_event)
             self._finished = True
 
@@ -66,36 +67,54 @@ class MultiModelResourceArbiter:
             raise ValueError(
                 "generator_phase_policy must be demand_aware or fixed_shared"
             )
+
+        # 各类执行流资源
+        # 这个未来可以考虑通用化，比如按照SM数量用map存储
         self._full_generator_stream = full_generator_stream
         self._shared_generator_stream = shared_generator_stream
         self._full_primary_stream = full_primary_stream
         self._shared_primary_stream = shared_primary_stream
+
+        # 调度策略保存
         self._generator_phase_policy = generator_phase_policy
+        # 观测相关
         self.trace_partition_nvtx = trace_partition_nvtx
+        # 线程间状态同步条件变量
         self._condition = threading.Condition()
+
+        # reasoner请求需求和资源占用周期、batch状态
         self._primary_demand = 0
         self._primary_epoch_id = 0
         self._primary_epoch_active = False
         self._primary_batches_submitted = 0
         self._primary_unscoped_batches = 0
+        self._active_primary_batch_mode: str | None = None
+
+        # reasoner统计量
         self._primary_full_batches = 0
         self._primary_shared_batches = 0
-        self._active_primary_batch_mode: str | None = None
-        self._pending_primary_completion: tuple[Any, str] | None = None
+        self._primary_waits = 0
+
+
+        # generation admission与租约状态
+        self._generator_request_active = False
         self._generator_admission_pending = False
         self._generator_waits_for_primary = 0
+
         self._primary_completion_drains = 0
         self._active_generator_lease: GeneratorPhaseLease | None = None
+        self._last_generator_phase: GeneratorExecutionPhase | None = None
+
         self._full_steps = 0
         self._shared_steps = 0
         self._phase_counts: dict[str, int] = {}
         self._generator_phase_trace: deque[dict[str, Any]] = deque(maxlen=256)
-        self._last_generator_phase: GeneratorExecutionPhase | None = None
-        self._generator_request_active = False
-        self._primary_waits = 0
+        # 延迟完成状态
         self._pending_generator_completion: tuple[
             Any, GeneratorExecutionPhase, int | None, str
         ] | None = None
+        self._pending_primary_completion: tuple[Any, str] | None = None
+
 
     def _drain_generator_completion(
         self,

@@ -1,0 +1,22 @@
+属性	数值	解释	统计范围/加总关系
+reasoner_engine_init_seconds	48.765728 s	Reasoner Engine 从开始创建到 EngineCore 完成启动、可以接受请求的端到端时间。	主进程端到端墙钟时间；等于 config creation 1.214169 s + runtime startup 47.551558 s。
+reasoner_config_creation_seconds	1.214169 s	AsyncEngineArgs 解析模型、tokenizer、调度、并行和编译配置并构造 VllmConfig 的时间。	主进程；发生在 EngineCore 启动前；可与 runtime startup 相加。
+reasoner_runtime_startup_seconds	47.551558 s	使用已经生成的 VllmConfig 构造 AsyncLLM，启动 EngineCore/Worker并等待 READY 的时间。	主进程墙钟时间；包含进程启动、IPC、Worker 初始化和前端初始化；等于 worker critical path 33.065935 s + runtime unaccounted 14.485623 s。
+reasoner_worker_accounted_critical_path_seconds	33.065935 s	当前插桩能够明确归入 Rank Worker 启动阶段的关键路径总和。	单 Rank 时为 Rank 0 各可加总阶段之和；TP 多 Rank 时取最慢 Rank，而不是对 Rank 求和。当前加总 device/distributed init、resource stream setup、model load、memory determination、KV cache init、primary compile/warmup/capture，以及额外 full-variant capture。
+reasoner_runtime_unaccounted_seconds	14.485623 s	runtime startup 减去已归类 Worker 关键路径后剩余的时间。	残差而非单一操作；可能包含 EngineCore spawn/import、HELLO/READY IPC、前端 renderer/input/output processor、多模态前端 warmup、Executor/Scheduler 构造及其他同步。不能再与 runtime startup 相加。
+device_and_distributed_init_seconds	1.120858 s	Worker 初始化 CUDA device、分布式状态和 vLLM 基础运行环境的时间。	Rank 0 Worker；调用原生 GPUWorker.init_device() 的时间，不包含随后创建共置 stream 的时间。
+resource_stream_setup_seconds	0.086639 s	创建 Green Context pair、Generator/Reasoner shared stream、full-SM stream、resource arbiter 及 graph-capture stream patch 的时间。	Rank 0 Worker；本项目新增的共置资源 stream 初始化阶段。
+model_load_seconds	2.672698 s	构造 Reasoner 模型并将 checkpoint 权重加载到设备的时间。	Rank 0 Worker；包含 vLLM load_model 路径，不包含此前 config 解析，也不包含后续 profile/compile。
+memory_determination_seconds	26.308210 s	vLLM determine_available_memory() 整体调用时间；在手工指定 KV budget 时主要承担 profile run、AOT/compile artifact 恢复及相关准备工作。	Rank 0 Worker；父指标，包含 encoder execution、model profile and compile、memory determination other；本次 memory_profiling_performed=False，因此不能命名为真实显存 profiling。
+encoder_execution_seconds	0.842566 s	profile run 中执行多模态 encoder dummy workload 的时间。	Rank 0 Worker；是 memory determination 的子项，不能与 memory determination 再次相加；不一定覆盖 dummy 输入准备。
+model_profile_and_compile_seconds	18.565411 s	profile run 中执行主模型 dummy run 的时间，同时包含该路径触发的 torch.compile/AOT artifact 加载或恢复。	Rank 0 Worker；是 memory determination 的子项；当前尚未把模型 forward 与 AOT artifact 恢复进一步分开。
+memory_determination_other_seconds	6.900232 s	memory determination 总时间扣除已观测 encoder execution 和 model profile/compile 后的剩余部分。	Rank 0 Worker 残差；包含 dummy 输入准备、sampler/profile 收尾、device synchronization、encoder cache 清理、Python GC、allocator 查询及计时 hook 未覆盖部分。
+memory_profiling_performed	False	表示本次是否执行了根据 activation 峰值自动估算 KV Cache 容量的真实显存 profiling。	布尔状态而非耗时；False 是因为显式设置了 kv_cache_memory_bytes，虽然仍会执行用于编译和预热的 profile run。
+kv_cache_initialization_seconds	0.023623 s	按照给定 KV Cache 配置建立并绑定 KV Cache storage 的时间。	Rank 0 Worker；只统计初始化耗时，不代表 KV Cache 容量或显存占用。
+primary_compile_warmup_capture_seconds	2.826581 s	主 Reasoner 路径的 compile/warmup 和 primary CUDA Graph capture 总时间。	Rank 0 Worker；父指标，已包含 compile_warmup_other 1.952268 s 与 shared_graph_capture 0.874313 s；这两个子项不能再次与它相加。
+compile_warmup_other_seconds	1.952268 s	primary compile/warmup/capture 总时间中，扣除 shared graph capture 后的编译、JIT、autotune 和 warmup 时间。	Rank 0 Worker；是 primary_compile_warmup_capture_seconds 的子项。
+shared_graph_capture_seconds	0.874313 s	捕获 Reasoner shared/受限-SM CUDA Graph variant 的时间。	Rank 0 Worker；是 primary_compile_warmup_capture_seconds 的子项，也是 total_graph_capture_seconds 的组成项。
+full_variant_capture_seconds	0.027326 s	在 shared variant 之后额外捕获 Reasoner full-SM CUDA Graph variant 的时间。	Rank 0 Worker；不包含在 primary_compile_warmup_capture_seconds 中；计入 Worker accounted critical path 和 total_graph_capture_seconds。
+full_variant_cleanup_seconds	0.000053 s	full variant capture 后执行临时对象清理和 empty-cache 尝试的时间。	Rank 0 Worker；当前极小；不是 graph 销毁，graph 与所需持久 workspace 仍被保留。
+total_graph_capture_seconds	0.901639 s	两套 Reasoner graph 明确 capture 时间之和。	等于 shared graph capture 0.874313 s + full variant capture 0.027326 s；展示性聚合指标，不能整体再加入 Worker accounted，因为 shared 部分已包含在 primary 指标中。
+total_graph_setup_seconds	0.901692 s	两套 graph capture 加 full-variant cleanup 的总 setup 时间。	等于 total graph capture 0.901639 s + cleanup 0.000053 s；展示性聚合指标，不用于启动关键路径重复加总。

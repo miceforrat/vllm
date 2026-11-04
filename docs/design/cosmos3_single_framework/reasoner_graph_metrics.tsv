@@ -1,0 +1,21 @@
+指标	含义	统计范围/注意事项
+Reasoner Engine init	从开始创建 Reasoner Engine 到 Engine 可接受请求的总启动时间	包含模型加载、显存分析、KV Cache、编译、CUDA Graph capture 和 Engine 编排等阶段
+model load	创建模型并将权重加载到 GPU 所需的时间	主要包括模型构造、权重读取、权重映射及 H2D 加载
+memory profiling	vLLM 为估算可用显存、activation 峰值和 KV Cache 容量而执行 profiling forward 的时间	属于 vLLM 原生启动流程，不是额外实现的内存记账
+KV cache	根据 profiling 结果分配并初始化 KV Cache 的时间	这里只统计初始化耗时，不表示 KV Cache 的显存大小
+Compile/warmup/primary capture	主执行路径进行 torch.compile、kernel warmup 和首次或主 CUDA Graph capture 的组合时间	包含多个动作，不能全部解释为 graph capture
+Compile/warmup/other	除主路径外的其他 compile、JIT 和 kernel warmup 时间	包括已知属于编译或预热但尚未进一步拆分的耗时
+Shared graph capture	捕获 Shared 分区下 Reasoner CUDA Graph 的时间	Shared 表示 Reasoner 与 Generator 共置时使用受限 SM 分区
+Full variant capture	额外捕获 Reasoner full-SM CUDA Graph variant 的时间	是第二套资源 variant 的增量捕获时间，不包含 Shared graph
+Graph capture 合计	Shared graph capture 与 Full variant capture 的时间之和	只统计明确记录的 graph capture，不包含 compile、warmup 和 Engine 编排
+Engine orchestration/未归类	Engine init 总时间减去所有已单独统计启动阶段后的剩余时间	可能包括进程和 RPC 建立、Worker 协调、同步、Python 控制流及未插桩阶段
+Shared capture total device delta	完成 Shared variant capture 后 GPU 可用显存相对 capture 前减少的总量	可能包含 graph pool、library workspace、allocator segment 和 CUDA 内部状态，不能直接称为 Graph 显存
+Additional full-variant capture total device delta	在 Shared variant 已存在的基础上捕获 Full variant 后额外减少的 GPU 可用显存	包含 cuBLAS workspace、graph pool 和其他 capture-time 分配
+Dual-variant capture total device delta	Shared 和 Full 两套 variant 建立后的设备级总显存增量	通常等于 Shared capture total device delta 与 Additional full-variant capture total device delta 之和
+Shared graph-pool segment	Shared graph capture 后 PyTorch CUDA Graph 私有内存池持有的 allocator segment 大小	表示内存池保留的 segment，不等于实际存活 tensor 大小
+Full graph-pool segment delta	捕获 Full variant 后 graph pool 新增的 allocator segment 大小	即使共用 pool handle，不同 capture stream 仍可能增加新 segment
+Full default-pool allocated delta	捕获 Full variant 后 PyTorch 默认 CUDA allocator pool 中新增的存活分配	当前主要包含新 Reasoner stream 的 cuBLAS workspace
+Full default-pool reserved delta	捕获 Full variant 后 PyTorch 默认 CUDA allocator pool 新增的 reserved segment 容量	包含 allocated，两者不能相加；未使用部分可被后续 allocation 复用
+Full cuBLAS workspace allocated delta	Full variant 的新执行 stream 首次运行 GEMM 时 cuBLAS 或 cuBLASLt 保留的 scratch workspace	通过 allocation stack 归因；受 CUBLAS_WORKSPACE_CONFIG 影响，不是模型输出或 CUDA Graph 节点
+Steady-state allocated growth	压力测试最后一轮相对第一轮 torch.cuda.memory_allocated 的增长量	用于判断是否持续产生新的存活 GPU allocation
+Steady-state reserved growth	压力测试最后一轮相对第一轮 torch.cuda.memory_reserved 的增长量	用于判断 PyTorch caching allocator 的保留池是否持续扩张

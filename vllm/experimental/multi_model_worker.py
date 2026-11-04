@@ -7,71 +7,16 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field, replace
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
-
-@dataclass(frozen=True)
-class CommunicationGroupSpec:
-    """Engine-planned communication domain materialized by each worker."""
-
-    group_id: str
-    parallel_dimension: str
-    ranks: tuple[int, ...]
-    backend: str | None = None
-    use_device_communicator: bool = True
-
-    @classmethod
-    def from_rpc_payload(
-        cls, payload: Mapping[str, Any] | "CommunicationGroupSpec"
-    ) -> "CommunicationGroupSpec":
-        if isinstance(payload, cls):
-            return payload
-        values = dict(payload)
-        values["ranks"] = tuple(int(rank) for rank in values["ranks"])
-        return cls(**values)
-
-
-@dataclass(frozen=True)
-class ModelDeploymentSpec:
-    """Serializable description of an auxiliary model runner."""
-
-    model_id: str
-    model_path: str
-    backend: str
-    task: str
-    worker_ranks: tuple[int, ...] = ()
-    communication_groups: tuple[CommunicationGroupSpec, ...] = ()
-    load_format: str = "default"
-    backend_options: Mapping[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def from_rpc_payload(cls, payload: Mapping[str, Any]) -> "ModelDeploymentSpec":
-        values = dict(payload)
-        values["worker_ranks"] = tuple(
-            int(rank) for rank in values.get("worker_ranks", (0,))
-        )
-        values["communication_groups"] = tuple(
-            CommunicationGroupSpec.from_rpc_payload(group)
-            for group in values.get("communication_groups", ())
-        )
-        return cls(**values)
-
-    def to_rpc_payload(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class _RunnerSlot:
-    spec: ModelDeploymentSpec
-    adapter: Any
-    runner: Any
-    communication_group_ids: tuple[str, ...] = ()
-    pending_future: Future[Any] | None = None
-    pending_start: threading.Event | None = None
-    pending_started: threading.Event | None = None
-    pending_job_id: str | None = None
+from vllm.experimental.model_instance_registry import (
+    CommunicationGroupSpec,
+    ModelInstance,
+    ModelInstanceRegistry,
+    ModelSpec,
+)
 
 
 @dataclass
@@ -82,7 +27,45 @@ class _CommunicationGroupSlot:
 
 
 class MultiModelWorkerExtension:
-    """Own auxiliary runners beside the worker's primary model runner."""
+    """Own a unified registry of scheduler-managed and runtime-added models."""
+
+    def _model_instance_registry(self) -> ModelInstanceRegistry:
+        registry = getattr(self, "_vllm_model_instance_registry", None)
+        if registry is not None:
+            return registry
+
+        from vllm.distributed.parallel_state import get_tp_group
+
+        registry = ModelInstanceRegistry()
+        config = getattr(self, "vllm_config", None)
+        additional = getattr(config, "additional_config", None)
+        runtime = (
+            additional.get("multi_model_runtime", {})
+            if isinstance(additional, dict)
+            else {}
+        )
+        primary_model_id = str(runtime.get("primary_model_id", "reasoner"))
+        model_config = getattr(self, "model_config", None)
+        model_path = str(getattr(model_config, "model", primary_model_id))
+        tp_ranks = tuple(int(rank) for rank in get_tp_group().ranks)
+        primary_spec = ModelSpec(
+            model_id=primary_model_id,
+            model_path=model_path,
+            backend="vllm",
+            capabilities=("text_generation",),
+            default_task="text_generation",
+            worker_ranks=tp_ranks,
+        )
+        registry.register(
+            ModelInstance(
+                spec=primary_spec,
+                runner=self.model_runner,
+                scheduler_managed=True,
+                runtime_added=False,
+            )
+        )
+        self._vllm_model_instance_registry = registry
+        return registry
 
     @staticmethod
     def _describe_group(group: Any) -> dict[str, Any]:
@@ -120,22 +103,25 @@ class MultiModelWorkerExtension:
             "pp": self._describe_group(pp),
         }
 
-    def register_auxiliary_runner(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        spec = ModelDeploymentSpec.from_rpc_payload(payload)
-        slots = self._auxiliary_runner_slots()
-        if spec.model_id in slots:
-            raise ValueError(f"Runner {spec.model_id!r} is already registered")
+    def register_model(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Materialize one runtime-added model in the unified registry."""
+        spec = ModelSpec.from_rpc_payload(payload)
         if self.rank not in spec.worker_ranks:
+            # 不需要创建并行组
             return {
                 "model_id": spec.model_id,
                 "active": False,
                 "rank": self.rank,
             }
+        registry = self._model_instance_registry()
+        if spec.model_id in registry:
+            raise ValueError(f"Model {spec.model_id!r} is already registered")
         if spec.backend != "vllm_omni":
             raise ValueError(f"Unsupported auxiliary backend: {spec.backend!r}")
 
         from vllm.distributed.parallel_state import get_tp_group
 
+        # 目前只支持同态TP
         tp_ranks = tuple(int(rank) for rank in get_tp_group().ranks)
         if tuple(spec.worker_ranks) != tp_ranks:
             raise ValueError(
@@ -170,6 +156,7 @@ class MultiModelWorkerExtension:
             spec.model_path,
             cli_overrides=spec.backend_options,
         )
+        # 创建辅助runner
         adapter = EmbeddedOmniDiffusionRunner(
             resolved,
             device=str(self.device),
@@ -203,13 +190,19 @@ class MultiModelWorkerExtension:
                     spec.model_id, (tp_spec.group_id,)
                 )
             raise
-        slots[spec.model_id] = _RunnerSlot(
-            spec,
-            adapter,
-            runner,
+        instance = ModelInstance(
+            spec=spec,
+            adapter=adapter,
+            runner=runner,
+            runtime_added=True,
             communication_group_ids=(tp_spec.group_id,),
         )
-        return self._describe_auxiliary_slot(slots[spec.model_id])
+        registry.register(instance)
+        return self._describe_model_instance(instance)
+
+    def register_auxiliary_runner(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Compatibility alias for clients created before ``register_model``."""
+        return self.register_model(payload)
 
     def execute_auxiliary_runner(
         self, model_id: str, request: Any, profile_memory: bool = False
@@ -330,7 +323,7 @@ class MultiModelWorkerExtension:
 
     def release_prepared_auxiliary_runners(self) -> list[str]:
         released = []
-        for model_id, slot in self._auxiliary_runner_slots().items():
+        for model_id, slot in self._model_instance_registry().runtime_items():
             if slot.pending_start is not None:
                 slot.pending_start.set()
                 slot.pending_start = None
@@ -403,13 +396,21 @@ class MultiModelWorkerExtension:
         return slot.adapter.stream_control_stats()
 
     def auxiliary_runner_metadata(self, model_id: str) -> dict[str, Any]:
-        return self._describe_auxiliary_slot(self._get_auxiliary_slot(model_id))
+        return self._describe_model_instance(self._get_auxiliary_slot(model_id))
+
+    def model_registry_metadata(self) -> list[dict[str, Any]]:
+        """Describe every model hosted by this Worker, including primary."""
+        return [
+            self._describe_model_instance(instance)
+            for instance in self._model_instance_registry().values()
+        ]
 
     def close_auxiliary_runners(self) -> list[str]:
-        slots = self._auxiliary_runner_slots()
-        model_ids = list(slots)
+        registry = self._model_instance_registry()
+        slots = list(registry.runtime_instances())
+        model_ids = [slot.spec.model_id for slot in slots]
         self.release_prepared_auxiliary_runners()
-        for slot in reversed(list(slots.values())):
+        for slot in reversed(slots):
             if slot.pending_future is not None:
                 slot.pending_future.result()
                 slot.pending_future = None
@@ -424,7 +425,7 @@ class MultiModelWorkerExtension:
             self._release_communication_groups(
                 slot.spec.model_id, slot.communication_group_ids
             )
-        slots.clear()
+            registry.remove(slot.spec.model_id)
         pool = getattr(self, "_vllm_auxiliary_thread_pool", None)
         if pool is not None:
             pool.shutdown(wait=True)
@@ -442,6 +443,8 @@ class MultiModelWorkerExtension:
         self, spec: CommunicationGroupSpec, owner: str
     ) -> Any:
         """Materialize or reuse one Engine-planned communication domain."""
+        # 创建属于具体runner的并行组（按照runner计数）
+        # 实际还是属于worker
         slots = self._communication_group_slots()
         existing = slots.get(spec.group_id)
         if existing is not None:
@@ -491,21 +494,25 @@ class MultiModelWorkerExtension:
                 slot.group.destroy()
                 del slots[group_id]
 
-    def _auxiliary_runner_slots(self) -> dict[str, _RunnerSlot]:
-        slots = getattr(self, "_vllm_auxiliary_runner_slots", None)
-        if slots is None:
-            slots = {}
-            self._vllm_auxiliary_runner_slots = slots
-        return slots
+    def _auxiliary_runner_slots(self) -> dict[str, ModelInstance]:
+        """Compatibility view containing only runtime-added models."""
+        registry = getattr(self, "_vllm_model_instance_registry", None)
+        if registry is None:
+            return {}
+        return dict(registry.runtime_items())
 
-    def _get_auxiliary_slot(self, model_id: str) -> _RunnerSlot:
+    def _get_auxiliary_slot(self, model_id: str) -> ModelInstance:
         try:
-            return self._auxiliary_runner_slots()[model_id]
+            instance = self._model_instance_registry().get(model_id)
         except KeyError as exc:
             raise KeyError(f"Unknown auxiliary runner: {model_id!r}") from exc
+        if not instance.runtime_added:
+            raise KeyError(f"Model {model_id!r} is not a runtime-added runner")
+        return instance
 
-    def _describe_auxiliary_slot(self, slot: _RunnerSlot) -> dict[str, Any]:
-        return {
+    def _describe_model_instance(self, slot: ModelInstance) -> dict[str, Any]:
+        runner = slot.runner
+        description = {
             "model_id": slot.spec.model_id,
             "active": True,
             "rank": self.rank,
@@ -517,11 +524,18 @@ class MultiModelWorkerExtension:
                 f"{type(self.model_runner).__name__}"
             ),
             "backend": slot.spec.backend,
-            "task": slot.spec.task,
+            "capabilities": list(slot.spec.capabilities),
+            "default_task": slot.spec.default_task,
+            "scheduler_managed": slot.scheduler_managed,
+            "runtime_added": slot.runtime_added,
             "runner_type": (
-                f"{type(slot.runner).__module__}.{type(slot.runner).__name__}"
+                f"{type(runner).__module__}.{type(runner).__name__}"
             ),
-            "pipeline_type": type(slot.runner.pipeline).__name__,
+        }
+        if slot.adapter is None:
+            return description
+        description.update({
+            "pipeline_type": type(runner.pipeline).__name__,
             "parallel_topology": slot.adapter.parallel_topology_stats(),
             "communication_groups": [
                 self._describe_group(
@@ -531,7 +545,8 @@ class MultiModelWorkerExtension:
             ],
             "memory_pool_usage_bytes": slot.adapter.memory_pool_usage(),
             "stream_control": slot.adapter.stream_control_stats(),
-        }
+        })
+        return description
 
 
 class WorkerHostedRunnerClient:
@@ -540,17 +555,19 @@ class WorkerHostedRunnerClient:
     def __init__(self, llm_engine: Any):
         self._llm_engine = llm_engine
 
-    def register(self, spec: ModelDeploymentSpec) -> list[dict[str, Any]]:
+    def register(self, spec: ModelSpec) -> list[dict[str, Any]]:
         planned = self._plan_homogeneous_tp(spec)
-        return self._rpc("register_auxiliary_runner", planned.to_rpc_payload())
+        return self._rpc("register_model", planned.to_rpc_payload())
 
     def _plan_homogeneous_tp(
-        self, spec: ModelDeploymentSpec
-    ) -> ModelDeploymentSpec:
+        self, spec: ModelSpec
+    ) -> ModelSpec:
         """Resolve the current Gate's topology from the owning Engine config."""
         if spec.communication_groups:
             return spec
 
+        # 这里从engine读取config
+        # 这个写法很不好，未来肯定是要改成逐层向下传递的
         config = self._llm_engine.vllm_config
         parallel = config.parallel_config
         tp_size = int(parallel.tensor_parallel_size)
@@ -582,6 +599,10 @@ class WorkerHostedRunnerClient:
         self, worker_ranks: tuple[int, ...] = ()
     ) -> list[dict[str, Any]]:
         return self._rpc("inspect_multi_model_topology", worker_ranks)
+
+    def models(self) -> list[dict[str, Any]]:
+        """Return the unified Worker-local model registry on every rank."""
+        return self._rpc("model_registry_metadata")
 
     def configure_stream(
         self,
@@ -739,11 +760,11 @@ class AsyncWorkerHostedRunnerClient(WorkerHostedRunnerClient):
     """
 
     async def register(
-        self, spec: ModelDeploymentSpec
+        self, spec: ModelSpec
     ) -> list[dict[str, Any]]:
         planned = self._plan_homogeneous_tp(spec)
         return await self._rpc_async(
-            "register_auxiliary_runner", planned.to_rpc_payload()
+            "register_model", planned.to_rpc_payload()
         )
 
     async def topology(

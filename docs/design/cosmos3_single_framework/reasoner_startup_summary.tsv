@@ -1,0 +1,20 @@
+类别	属性	数值	解释	统计范围/加总关系
+关键路径	engine_startup_total_seconds	49.096 s	Reasoner Engine 从开始创建到主进程确认 EngineCore READY 的端到端墙钟时间。	顶层总指标；不要与下列关键路径阶段再次相加。
+关键路径	config_creation_seconds	1.149 s	解析模型、tokenizer、调度、并行和编译配置并生成 VllmConfig。	关键路径组成项；约为 0.000–1.149s。
+关键路径	frontend_initialization_seconds	5.625 s	初始化 Renderer、InputProcessor 和 OutputProcessor。	关键路径组成项；约为 1.160–6.785s，其中 Renderer 1.372s、InputProcessor 4.253s、OutputProcessor 接近 0s。
+关键路径	engine_core_spawn_seconds	7.829 s	父进程启动 EngineCore 后，子进程完成解释器启动和必要模块导入并发送 HELLO。	关键路径组成项；6.793–14.622s。Process.start() 本身只有约 4ms，本指标统计的是直到子进程真正可握手的时间。
+关键路径	engine_core_pre_worker_seconds	1.509 s	EngineCore 发送 HELLO 后，到 Rank 0 Worker 开始 device/distributed 初始化前的构造和握手准备。	关键路径组成项；14.622–16.131s。
+关键路径	worker_startup_seconds	32.938 s	Rank 0 Worker 从 device/distributed 初始化开始，到额外 full-SM graph variant capture 完成。	关键路径组成项；16.131–49.069s。TP 场景应取最慢 Rank 的区间，不对各 Rank 求和。
+关键路径	engine_ready_finalize_seconds	0.027 s	Worker 启动完成后，EngineCore 完成收尾、发送 READY，并由主进程返回。	关键路径组成项；约为 49.069–49.096s。
+并行阶段	frontend_mm_warmup_seconds	9.042 s	前端多模态 processor 使用 dummy 输入进行后台 warmup。	6.793–15.835s，与 EngineCore spawn 和早期初始化重叠；不加入关键路径阶段之和。
+Worker	reasoner_device_runtime_init_seconds	1.156 s	初始化 CUDA device、分布式状态和 vLLM Worker 基础运行环境。	Worker startup 子项；16.131–17.287s。
+Worker	colocation_resource_stream_setup_seconds	0.088 s	创建 Green Context pair、shared/full streams、resource arbiter 和 graph stream patch。	Worker startup 子项；17.287–17.375s，是本项目新增的共置资源初始化成本。
+Worker	reasoner_model_load_seconds	2.713 s	构造 Reasoner 模型并加载 checkpoint 权重到设备。	Worker startup 子项；17.375–20.088s。
+Worker	profile_and_memory_preparation_seconds	26.060 s	执行用于最大负载准备的 profile run，包括 dummy MM 输入准备、encoder、模型 dummy forward、AOT artifact 恢复及清理。	Worker startup 子项；20.089–46.150s。本次显式指定 KV budget，因此不代表自动显存容量 profiling。
+Worker	kv_cache_initialization_seconds	0.004 s	根据指定配置建立并绑定 Reasoner KV Cache storage。	Worker startup 子项；46.151–46.155s，只表示初始化耗时，不表示 KV Cache 容量。
+Worker	primary_compile_graph_setup_seconds	2.885 s	主 Reasoner shared 路径的 kernel warmup、compile 准备和 primary CUDA Graph capture。	Worker startup 子项；46.155–49.040s，已包含 shared graph capture，不能与其重复加总。
+Worker	additional_full_graph_capture_seconds	0.027 s	额外捕获 Reasoner full-SM CUDA Graph variant。	Worker startup 子项；49.042–49.069s，不包含在 primary setup 中。
+Graph	shared_graph_capture_seconds	0.874 s	捕获 Reasoner shared/受限-SM graph variant 的明确 capture 时间。	primary_compile_graph_setup_seconds 的子项；用于 graph 实现对比，不再加入 Worker 总时间。
+Graph	full_graph_capture_seconds	0.027 s	捕获额外 full-SM graph variant 的明确 capture 时间。	与 additional_full_graph_capture_seconds 是同一阶段的 graph 视角命名。
+Graph	dual_graph_capture_total_seconds	0.902 s	两套 Reasoner graph 的明确 capture 时间总和。	等于 shared 0.874s + full 0.027s，存在显示精度舍入；仅用于普通/breakable graph 对比，不加入关键路径总和。
+配置	memory_profiling_performed	False	本次没有根据 activation 峰值自动计算 KV Cache 容量，因为显式设置了 kv_cache_memory_bytes。	布尔实验元数据，不是耗时指标；虽然为 False，仍会执行 profile run 以完成编译与预热。

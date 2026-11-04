@@ -289,6 +289,13 @@ class BreakableCUDAGraphWrapper:
         self.is_debugging_mode = logger.isEnabledFor(logging.DEBUG)
 
         self.entries: dict[BatchDescriptor, _BreakableEntry] = {}
+        # Diagnostic counters are deliberately host-only. They make it
+        # possible to distinguish "the wrapper exists" from "measured model
+        # execution actually replayed a breakable graph" without changing
+        # capture or replay ordering.
+        self.capture_calls = 0
+        self.replay_calls = 0
+        self.eager_fallback_calls = 0
         BreakableCUDAGraphWrapper._all_instances.add(self)
 
         logger.info_once("Breakable CUDA graph enabled")
@@ -317,6 +324,7 @@ class BreakableCUDAGraphWrapper:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if not is_forward_context_available():
+            self.eager_fallback_calls += 1
             return self.runnable(*args, **kwargs)
 
         forward_context = get_forward_context()
@@ -330,6 +338,7 @@ class BreakableCUDAGraphWrapper:
             self.runtime_mode is not None
             and cudagraph_runtime_mode != self.runtime_mode
         ):
+            self.eager_fallback_calls += 1
             return self.runnable(*args, **kwargs)
 
         assert batch_descriptor is not None
@@ -339,7 +348,9 @@ class BreakableCUDAGraphWrapper:
             self.entries[batch_descriptor] = entry
 
         if entry.capture is None:
+            self.capture_calls += 1
             return self._capture(entry, args, kwargs)
+        self.replay_calls += 1
         return self._replay(entry, args, kwargs)
 
     # --- capture / replay paths -----------------------------------------

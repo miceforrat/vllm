@@ -4,9 +4,10 @@
 import contextlib
 import os
 import threading
+import time
 import weakref
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from multiprocessing import connection
 from multiprocessing.process import BaseProcess
@@ -1126,6 +1127,7 @@ class CoreEngineLaunch:
     # Frontend processes to watch during engine startup; may be assigned by
     # the caller before the startup barrier runs on context manager exit.
     watched_frontend_processes: Sequence[FrontendProcess] = ()
+    startup_timeline: dict[str, float] = field(default_factory=dict)
 
 
 @contextlib.contextmanager
@@ -1136,6 +1138,7 @@ def launch_core_engines(
     addresses: EngineZmqAddresses,
 ) -> Iterator[CoreEngineLaunch]:
     """Launch engine and DP coordinator processes as needed."""
+    launch_started = time.perf_counter()
     parallel_config = vllm_config.parallel_config
     dp_size = parallel_config.data_parallel_size
     local_engine_count = parallel_config.data_parallel_size_local
@@ -1246,6 +1249,7 @@ def launch_core_engines(
     ) as handshake_socket:
         # Start local engines.
         if local_engine_count:
+            process_start_begin = time.perf_counter()
             local_engine_manager = CoreEngineProcManager(
                 vllm_config=vllm_config,
                 executor_class=executor_class,
@@ -1258,13 +1262,25 @@ def launch_core_engines(
                 local_start_index=local_start_index or 0,
                 tensor_queue=tensor_queue,
             )
+            process_start_end = time.perf_counter()
         else:
             local_engine_manager = None
+            process_start_begin = process_start_end = time.perf_counter()
 
         launch = CoreEngineLaunch(
-            local_engine_manager, coordinator, addresses, tensor_queue
+            local_engine_manager,
+            coordinator,
+            addresses,
+            tensor_queue,
+            startup_timeline={
+                "core_launch_start": launch_started,
+                "core_process_start_begin": process_start_begin,
+                "core_process_start_end": process_start_end,
+            },
         )
+        launch.startup_timeline["startup_barrier_begin"] = time.perf_counter()
         yield launch
+        launch.startup_timeline["startup_wait_begin"] = time.perf_counter()
         wait_for_engine_startup(
             handshake_socket,
             engines_to_handshake,
@@ -1273,6 +1289,7 @@ def launch_core_engines(
             vllm_config.cache_config,
             launch,
         )
+        launch.startup_timeline["startup_wait_end"] = time.perf_counter()
 
 
 def wait_for_engine_startup(
@@ -1390,6 +1407,9 @@ def wait_for_engine_startup(
                 )
 
         if status == "HELLO" and engine.state == CoreEngineState.NEW:
+            launch.startup_timeline.setdefault(
+                "first_engine_hello", time.perf_counter()
+            )
             # Send init message with DP config info.
             init_message = msgspec.msgpack.encode(
                 EngineHandshakeMetadata(
@@ -1412,6 +1432,9 @@ def wait_for_engine_startup(
             start_pending[0 if local else 1] += 1
             engine.state = CoreEngineState.CONNECTED
         elif status == "READY" and engine.state == CoreEngineState.CONNECTED:
+            launch.startup_timeline.setdefault(
+                "first_engine_ready", time.perf_counter()
+            )
             # Validate config hash consistency across DP workers for MoE models.
             if coordinated_dp:
                 worker_config_hash = msg.get("parallel_config_hash")
@@ -1431,6 +1454,8 @@ def wait_for_engine_startup(
 
             start_pending[0 if local else 1] -= 1
             engine.state = CoreEngineState.READY
+            if not any(start_pending):
+                launch.startup_timeline["all_engines_ready"] = time.perf_counter()
         else:
             raise RuntimeError(
                 f"Unexpected {status} message for "

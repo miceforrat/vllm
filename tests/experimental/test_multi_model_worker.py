@@ -4,10 +4,14 @@ import asyncio
 from typing import Any
 
 import vllm.experimental.multi_model_worker as multi_model_worker
+from vllm.experimental.model_instance_registry import (
+    ModelInstance,
+    ModelInstanceRegistry,
+)
 from vllm.experimental.multi_model_worker import (
     AsyncWorkerHostedRunnerClient,
     CommunicationGroupSpec,
-    ModelDeploymentSpec,
+    ModelSpec,
     MultiModelWorkerExtension,
     WorkerHostedRunnerClient,
 )
@@ -48,17 +52,18 @@ class _FakeAsyncEngine(_FakeEngine):
 def test_client_submits_serializable_model_spec() -> None:
     engine = _FakeEngine(
         {
-            "register_auxiliary_runner": [
+            "register_model": [
                 {"model_id": "generator-a", "active": True}
             ]
         }
     )
     client = WorkerHostedRunnerClient(engine)
-    spec = ModelDeploymentSpec(
+    spec = ModelSpec(
         model_id="generator-a",
         model_path="nvidia/Cosmos3-Edge",
         backend="vllm_omni",
-        task="text_to_video",
+        capabilities=("text_to_video",),
+        default_task="text_to_video",
         worker_ranks=(0, 1),
         communication_groups=(
             CommunicationGroupSpec(
@@ -74,7 +79,7 @@ def test_client_submits_serializable_model_spec() -> None:
 
     assert result == [{"model_id": "generator-a", "active": True}]
     method, args = engine.calls[0]
-    assert method == "register_auxiliary_runner"
+    assert method == "register_model"
     assert args[0]["worker_ranks"] == (0, 1)
     assert args[0]["communication_groups"][0]["group_id"] == "generator-a-tp"
     assert args[0]["backend_options"]["cache_backend"] == "sea_cache"
@@ -85,11 +90,12 @@ def test_worker_skips_model_not_placed_on_its_rank() -> None:
     worker.rank = 2
 
     result = worker.register_auxiliary_runner(
-        ModelDeploymentSpec(
+        ModelSpec(
             model_id="generator-a",
             model_path="nvidia/Cosmos3-Edge",
             backend="vllm_omni",
-            task="text_to_video",
+            capabilities=("text_to_video",),
+            default_task="text_to_video",
             worker_ranks=(0, 1),
         ).to_rpc_payload()
     )
@@ -279,11 +285,12 @@ def test_async_client_starts_and_collects_external_job(monkeypatch) -> None:
 
 
 def test_model_spec_restores_nested_communication_groups() -> None:
-    original = ModelDeploymentSpec(
+    original = ModelSpec(
         model_id="generator-a",
         model_path="model",
         backend="vllm_omni",
-        task="text_to_video",
+        capabilities=("text_to_video",),
+        default_task="text_to_video",
         worker_ranks=(0, 1),
         communication_groups=(
             CommunicationGroupSpec(
@@ -294,10 +301,50 @@ def test_model_spec_restores_nested_communication_groups() -> None:
         ),
     )
 
-    restored = ModelDeploymentSpec.from_rpc_payload(original.to_rpc_payload())
+    restored = ModelSpec.from_rpc_payload(original.to_rpc_payload())
 
     assert restored == original
     assert isinstance(restored.communication_groups[0], CommunicationGroupSpec)
+
+
+def test_registry_keeps_primary_and_runtime_added_models() -> None:
+    registry = ModelInstanceRegistry()
+    primary = ModelInstance(
+        spec=ModelSpec("reasoner", "reasoner", "vllm"),
+        runner=object(),
+        scheduler_managed=True,
+    )
+    generator = ModelInstance(
+        spec=ModelSpec("generator", "generator", "vllm_omni"),
+        runner=object(),
+        runtime_added=True,
+    )
+
+    registry.register(primary)
+    registry.register(generator)
+
+    assert registry.values() == (primary, generator)
+    assert registry.runtime_instances() == (generator,)
+    assert registry.remove("generator") is generator
+    assert registry.values() == (primary,)
+
+
+def test_registry_does_not_remove_engine_owned_primary() -> None:
+    registry = ModelInstanceRegistry()
+    registry.register(
+        ModelInstance(
+            spec=ModelSpec("reasoner", "reasoner", "vllm"),
+            runner=object(),
+            scheduler_managed=True,
+        )
+    )
+
+    try:
+        registry.remove("reasoner")
+    except ValueError as exc:
+        assert "Engine lifecycle" in str(exc)
+    else:
+        raise AssertionError("Engine-owned primary model was removed")
 
 
 def test_worker_group_registry_reuses_and_releases_by_owner() -> None:
@@ -331,14 +378,15 @@ def test_worker_group_registry_reuses_and_releases_by_owner() -> None:
 
 def test_client_derives_homogeneous_tp_topology_from_engine() -> None:
     engine = _FakeEngine(
-        {"register_auxiliary_runner": [{"model_id": "generator-b"}]}
+        {"register_model": [{"model_id": "generator-b"}]}
     )
     client = WorkerHostedRunnerClient(engine)
-    spec = ModelDeploymentSpec(
+    spec = ModelSpec(
         model_id="generator-b",
         model_path="model",
         backend="vllm_omni",
-        task="text_to_video",
+        capabilities=("text_to_video",),
+        default_task="text_to_video",
     )
 
     client.register(spec)
