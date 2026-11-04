@@ -22,11 +22,17 @@ import torch
 
 from vllm.experimental.multi_model_worker import (
     ModelSpec,
+    SchedulerModelRequest,
     WorkerHostedRunnerClient,
 )
 
 
-def _run_reasoner(reasoner: Any, prompt: str, max_tokens: int) -> dict[str, Any]:
+def _run_reasoner(
+    client: WorkerHostedRunnerClient,
+    reasoner: Any,
+    prompt: str,
+    max_tokens: int,
+) -> dict[str, Any]:
     from vllm import SamplingParams
 
     tokenizer = reasoner.get_tokenizer()
@@ -37,11 +43,18 @@ def _run_reasoner(reasoner: Any, prompt: str, max_tokens: int) -> dict[str, Any]
     )
     prompt_token_ids = tokenizer.encode(formatted_prompt)
     started = time.perf_counter()
-    outputs = reasoner.generate(
-        [formatted_prompt],
-        SamplingParams(temperature=0.0, seed=0, max_tokens=max_tokens),
-        use_tqdm=False,
+    future = client.submit(
+        client.primary_model_id,
+        SchedulerModelRequest(
+            prompt=[formatted_prompt],
+            sampling_params=SamplingParams(
+                temperature=0.0, seed=0, max_tokens=max_tokens
+            ),
+            request_id=f"sync-reasoner-{time.time_ns()}",
+            generate_kwargs={"use_tqdm": False},
+        ),
     )
+    outputs = future.result()
     torch.cuda.synchronize()
     candidate = outputs[0].outputs[0]
     return {
@@ -141,7 +154,7 @@ def _run_concurrent_once_impl(
         wall_start = time.perf_counter()
     else:
         wall_start = time.perf_counter()
-        generator_future = client.start_async(
+        generator_future = client.submit(
             model_id,
             generator_request,
             profile_memory=False,
@@ -152,7 +165,7 @@ def _run_concurrent_once_impl(
     reasoner_start = time.perf_counter()
     with torch.cuda.nvtx.range(f"worker.concurrent.reasoner.{index}"):
         reasoner_result = _run_reasoner(
-            reasoner, reasoner_prompt, args.reasoner_max_tokens
+            client, reasoner, reasoner_prompt, args.reasoner_max_tokens
         )
     reasoner_end = time.perf_counter()
     reasoner_result = {
@@ -417,7 +430,7 @@ def main() -> None:
     parser.add_argument(
         "--reasoner-graph-pool-mode",
         choices=("isolated", "shared"),
-        default="isolated",
+        default="shared",
         help=(
             "Keep the shared/full Reasoner CUDA Graph registries in separate "
             "memory pools, or reuse vLLM's global graph pool."
@@ -562,7 +575,7 @@ def main() -> None:
         **reasoner_execution,
         **worker_options,
     )
-    client = WorkerHostedRunnerClient(reasoner.llm_engine)
+    client = WorkerHostedRunnerClient(reasoner)
 
     cache_options: dict[str, Any] = {"cache_backend": "none"}
     if args.generator_cache == "sea_cache":
@@ -597,6 +610,7 @@ def main() -> None:
                 sm_count=None,
             )
         reasoner_result = _run_reasoner(
+            client,
             reasoner,
             reasoner_prompt,
             args.reasoner_max_tokens,
@@ -604,11 +618,11 @@ def main() -> None:
         generator_warmup_seconds = []
         for index in range(args.generator_warmups):
             started = time.perf_counter()
-            client.execute(
+            client.submit(
                 args.model_id,
                 _make_generator_request(args, f"worker-owned-warmup-{index:02d}"),
                 profile_memory=False,
-            )
+            ).result()
             torch.cuda.synchronize()
             generator_warmup_seconds.append(time.perf_counter() - started)
 
@@ -631,7 +645,7 @@ def main() -> None:
         for index in range(args.alone_repeats):
             serial_start = time.perf_counter()
             reasoner_alone = _run_reasoner(
-                reasoner, reasoner_prompt, args.reasoner_max_tokens
+                client, reasoner, reasoner_prompt, args.reasoner_max_tokens
             )
             generator_alone = client.execute_timed(
                 args.model_id,

@@ -131,6 +131,11 @@ class AsyncLLM(EngineClient):
         maybe_register_config_serialize_by_value()
 
         self.vllm_config = vllm_config
+        from vllm.experimental.multi_model_topology import TopologyPlanner
+
+        self.multi_model_topology_planner = TopologyPlanner(
+            vllm_config.parallel_config
+        )
         self._elastic_ep_lock = asyncio.Lock()
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config

@@ -62,6 +62,11 @@ class LLMEngine:
     ) -> None:
         configure_logging_if_needed(vllm_config.logging_config)
         self.vllm_config = vllm_config
+        from vllm.experimental.multi_model_topology import TopologyPlanner
+
+        self.multi_model_topology_planner = TopologyPlanner(
+            vllm_config.parallel_config
+        )
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
 

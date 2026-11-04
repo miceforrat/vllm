@@ -11,7 +11,7 @@ import torch
 
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
-from .reasoner_graph_variants import ReasonerGraphVariantRegistry
+from .reasoner_graph_variants import ModelGraphVariantManager
 
 
 def _pool_token_key(token: Any) -> str:
@@ -150,7 +150,7 @@ class MultiModelGPUWorker(GPUWorker):
         self._multi_model_resource_arbiter: Any | None = None
 
         # 保存并切换 Reasoner 的 shared 和 reasoner_full CUDA Graph 变体
-        self._multi_model_graph_registry = ReasonerGraphVariantRegistry()
+        self._multi_model_graph_manager = ModelGraphVariantManager()
 
         # 控制量
         self._multi_model_graph_pool_mode = "isolated"
@@ -403,19 +403,17 @@ class MultiModelGPUWorker(GPUWorker):
     def compile_or_warm_up_model(self):
         dual_variants = self._configure_reasoner_graph_capture()
         runner = self.model_runner
-        original_capture_model = runner.capture_model
-
-        # 目前是monkey patch临时替换
-        # 未来考虑正式化
         if dual_variants:
-
-            def capture_all_reasoner_variants(*args: Any, **kwargs: Any) -> int:
-                # 在这里传入原生的捕获方法
-                return self._capture_reasoner_graph_variants(
-                    original_capture_model, *args, **kwargs
+            if getattr(runner, "graph_variant_capture_provider", None) is not None:
+                raise RuntimeError(
+                    "GPUModelRunner already has a graph variant capture provider"
                 )
-
-            runner.capture_model = capture_all_reasoner_variants
+            self._multi_model_graph_manager.set_capture_handler(
+                self._capture_reasoner_graph_variants
+            )
+            runner.graph_variant_capture_provider = (
+                self._multi_model_graph_manager
+            )
         started = time.perf_counter()
         self._multi_model_startup_timeline[
             "primary_compile_warmup_capture_start"
@@ -425,7 +423,8 @@ class MultiModelGPUWorker(GPUWorker):
                 result = super().compile_or_warm_up_model()
         finally:
             if dual_variants:
-                runner.capture_model = original_capture_model
+                runner.graph_variant_capture_provider = None
+                self._multi_model_graph_manager.clear_capture_handler()
         primary_total = time.perf_counter() - started
         self._multi_model_startup_timeline[
             "primary_compile_warmup_capture_end"
@@ -468,7 +467,7 @@ class MultiModelGPUWorker(GPUWorker):
             else {}
         )
         pool_mode = str(
-            green.get("reasoner_graph_pool_mode", "isolated")
+            green.get("reasoner_graph_pool_mode", "shared")
         )
         if pool_mode not in {"isolated", "shared"}:
             raise ValueError(
@@ -526,7 +525,10 @@ class MultiModelGPUWorker(GPUWorker):
         return len(manager.graphs)
 
     def _capture_reasoner_graph_variants(
-        self, capture_shared: Any, *args: Any, **kwargs: Any
+        self,
+        runner: Any,
+        capture_shared: Any,
+        **kwargs: Any,
     ) -> int:
         """Capture and register every Reasoner variant in one trigger.
 
@@ -538,7 +540,7 @@ class MultiModelGPUWorker(GPUWorker):
         shared_allocated_before = int(torch.cuda.memory_allocated(self.device))
         shared_reserved_before = int(torch.cuda.memory_reserved(self.device))
         shared_started = time.perf_counter()
-        shared_device_bytes = int(capture_shared(*args, **kwargs))
+        shared_device_bytes = int(capture_shared(**kwargs))
         shared_capture_seconds = time.perf_counter() - shared_started
         self.cuda_graph_memory_bytes = shared_device_bytes
         self.cuda_graph_capture_seconds = shared_capture_seconds
@@ -557,7 +559,7 @@ class MultiModelGPUWorker(GPUWorker):
             raise RuntimeError("vLLM did not capture the shared graph variant")
         shared_entry_sets = self._compiled_piecewise_entry_sets()
         # shared只进行注册是因为capture_shared已经执行了，未来需要统一接口
-        self._multi_model_graph_registry.register(
+        self._multi_model_graph_manager.register(
             "shared",
             shared_stream,
             shared,
@@ -569,7 +571,7 @@ class MultiModelGPUWorker(GPUWorker):
         full_device_bytes = self._capture_reasoner_graph_variant(
             "reasoner_full", shared, shared_entry_sets
         )
-        self._multi_model_graph_registry.activate(
+        self._multi_model_graph_manager.activate(
             self.model_runner, "shared"
         )
         return shared_device_bytes + full_device_bytes
@@ -843,7 +845,7 @@ class MultiModelGPUWorker(GPUWorker):
                 f"shared={shared_count} full={full_count}"
             )
 
-        self._multi_model_graph_registry.register(
+        self._multi_model_graph_manager.register(
             name,
             full_stream,
             full,
@@ -862,8 +864,8 @@ class MultiModelGPUWorker(GPUWorker):
             selected, mode = arbiter.select_primary_batch_stream()
             if selected is not None:
                 stream = selected
-            if self._multi_model_graph_registry.get("shared") is not None:
-                self._multi_model_graph_registry.activate(
+            if self._multi_model_graph_manager.get("shared") is not None:
+                self._multi_model_graph_manager.activate(
                     self.model_runner,
                     "reasoner_full" if mode == "reasoner_full" else "shared",
                 )
@@ -1027,12 +1029,12 @@ class MultiModelGPUWorker(GPUWorker):
                 else int(self._multi_model_reasoner_full_stream.cuda_stream)
             ),
             "graph_capture": None if patch is None else patch.stats(),
-            "reasoner_graph_variants": self._multi_model_graph_registry.counts(),
+            "reasoner_graph_variants": self._multi_model_graph_manager.counts(),
             "reasoner_graph_capture_plan": {
                 "orchestration": "single_vllm_capture_trigger",
                 "mode": self._multi_model_graph_capture_mode,
                 "variants": ["shared", "reasoner_full"],
-                "active": self._multi_model_graph_registry.active_name,
+                "active": self._multi_model_graph_manager.active_name,
             },
             "reasoner_cudagraph": {
                 "breakable_enabled": is_breakable_cudagraph_enabled(),
@@ -1130,7 +1132,7 @@ class MultiModelGPUWorker(GPUWorker):
                 self._multi_model_reasoner_full_stream = None
                 self._multi_model_active_reasoner_stream = None
                 self._multi_model_resource_arbiter = None
-                self._multi_model_graph_registry.clear()
+                self._multi_model_graph_manager.clear()
                 pair = self._multi_model_gc_pair
                 if pair is not None:
                     pair.close()

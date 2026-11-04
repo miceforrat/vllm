@@ -28,6 +28,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.experimental.multi_model_worker import (
     AsyncWorkerHostedRunnerClient,
     ModelSpec,
+    SchedulerModelRequest,
 )
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -57,6 +58,7 @@ def make_generator_request(args: argparse.Namespace, request_id: str) -> Any:
 
 
 async def run_reasoner(
+    client: AsyncWorkerHostedRunnerClient,
     engine: AsyncLLM,
     prompt: str,
     max_tokens: int,
@@ -71,21 +73,21 @@ async def run_reasoner(
     )
     prompt_token_ids = tokenizer.encode(formatted_prompt)
     started = time.perf_counter()
-    final_output = None
-    async for output in engine.generate(
-        prompt=formatted_prompt,
-        sampling_params=SamplingParams(
-            temperature=0.0,
-            seed=0,
-            max_tokens=max_tokens,
-            min_tokens=max_tokens if fixed_tokens else 0,
-            ignore_eos=fixed_tokens,
+    future = await client.submit(
+        client.primary_model_id,
+        SchedulerModelRequest(
+            prompt=formatted_prompt,
+            sampling_params=SamplingParams(
+                temperature=0.0,
+                seed=0,
+                max_tokens=max_tokens,
+                min_tokens=max_tokens if fixed_tokens else 0,
+                ignore_eos=fixed_tokens,
+            ),
+            request_id=request_id,
         ),
-        request_id=request_id,
-    ):
-        final_output = output
-    if final_output is None:
-        raise RuntimeError("AsyncLLM request produced no output")
+    )
+    final_output = await future.result()
     candidate = final_output.outputs[0]
     ended = time.perf_counter()
     return {
@@ -162,7 +164,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reasoner-graph-pool-mode",
         choices=("isolated", "shared"),
-        default="isolated",
+        default="shared",
         help=(
             "Keep the shared/full Reasoner CUDA Graph registries in separate "
             "memory pools, or reuse vLLM's global graph pool."
@@ -385,6 +387,7 @@ async def async_main(args: argparse.Namespace) -> None:
         for index in range(args.warmups):
             # warmup
             warmup_reasoner = await run_reasoner(
+                client,
                 engine,
                 args.reasoner_prompt,
                 args.reasoner_max_tokens,
@@ -396,7 +399,7 @@ async def async_main(args: argparse.Namespace) -> None:
             # thread-local; warming up through a direct EngineCore RPC and
             # serving through the thread pool makes GC/full stream ownership
             # ambiguous and also causes CUPTI to lose the serving thread.
-            warmup_future = await client.start_async(
+            warmup_future = await client.submit(
                 args.model_id,
                 make_generator_request(
                     args, f"async-warmup-generator-{index:02d}"
@@ -435,23 +438,15 @@ async def async_main(args: argparse.Namespace) -> None:
                 )
             wall_start = time.perf_counter()
             if args.submission_order == "generator_first":
-                # generator启动
-                # 未来需要统一一下这俩的请求方法
-                generator_future = await client.start_async(
+                generator_future = await client.submit(
                     args.model_id,
                     make_generator_request(args, f"async-generator-{suffix}"),
                 )
                 generator_submitted = time.perf_counter()
                 if args.reasoner_arrival_delay_seconds:
                     await asyncio.sleep(args.reasoner_arrival_delay_seconds)
-                demand_requested = time.perf_counter()
-                demand_state = (
-                    await client.set_primary_demand(True)
-                    if args.partition_policy == "dynamic"
-                    else None
-                )
-                demand_admitted = time.perf_counter()
                 reasoner_task = asyncio.create_task(run_reasoner(
+                    client,
                     engine,
                     args.reasoner_prompt,
                     args.reasoner_max_tokens,
@@ -459,14 +454,8 @@ async def async_main(args: argparse.Namespace) -> None:
                     args.reasoner_fixed_tokens,
                 ))
             else:
-                demand_requested = time.perf_counter()
-                demand_state = (
-                    await client.set_primary_demand(True)
-                    if args.partition_policy == "dynamic"
-                    else None
-                )
-                demand_admitted = time.perf_counter()
                 reasoner_task = asyncio.create_task(run_reasoner(
+                    client,
                     engine,
                     args.reasoner_prompt,
                     args.reasoner_max_tokens,
@@ -475,22 +464,15 @@ async def async_main(args: argparse.Namespace) -> None:
                 ))
                 if args.generator_arrival_delay_seconds:
                     await asyncio.sleep(args.generator_arrival_delay_seconds)
-                generator_future = await client.start_async(
+                generator_future = await client.submit(
                     args.model_id,
                     make_generator_request(args, f"async-generator-{suffix}"),
                 )
                 generator_submitted = time.perf_counter()
 
-            try:
-                reasoner = await reasoner_task
-                if args.trace_partition_nvtx:
-                    torch.cuda.nvtx.mark("reasoner/client_request_returned")
-            finally:
-                demand_released = (
-                    await client.set_primary_demand(False)
-                    if args.partition_policy == "dynamic"
-                    else None
-                )
+            reasoner = await reasoner_task
+            if args.trace_partition_nvtx:
+                torch.cuda.nvtx.mark("reasoner/client_request_returned")
 
             generator = await generator_future.result()
             if args.trace_partition_nvtx:
@@ -528,11 +510,10 @@ async def async_main(args: argparse.Namespace) -> None:
                     "generator_start_rpc_seconds": (
                         generator_submitted - wall_start
                     ),
-                    "primary_demand_admission_seconds": (
-                        demand_admitted - demand_requested
+                    "primary_demand_admission_seconds": None,
+                    "demand_managed_by_submit": (
+                        args.partition_policy == "dynamic"
                     ),
-                    "demand_state_after_admission": demand_state,
-                    "demand_state_after_release": demand_released,
                 },
                 "reasoner": reasoner,
                 "generator": generator,

@@ -738,6 +738,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             varlen_decode=self.adaptive_verification is not None,
             ubatch_runner=self.ubatch_runner,
         )
+        # Optional Worker-owned provider for equivalent resource-specific
+        # CUDA Graph variants. Normal vLLM execution leaves this unset.
+        self.graph_variant_capture_provider: Any | None = None
         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
             self.fast_prefill = FastPrefillHelper(
                 self.cudagraph_manager, self.max_num_tokens
@@ -1029,6 +1032,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
+        """Capture the configured graph set, optionally through a provider.
+
+        A resource-aware Worker may install ``graph_variant_capture_provider``
+        to capture multiple equivalent executable variants.  The provider is
+        passed the native one-variant implementation, so normal vLLM runners
+        retain exactly the existing capture path.
+        """
+        provider = getattr(self, "graph_variant_capture_provider", None)
+        if provider is not None:
+            return provider.capture_all(
+                self,
+                self._capture_model_once,
+                profile_only=profile_only,
+            )
+        return self._capture_model_once(profile_only=profile_only)
+
+    @torch.inference_mode()
+    def _capture_model_once(self, *, profile_only: bool = False) -> int:
         assert self.cudagraph_manager is not None
         capture_encoder = (
             self.model_state.supports_mm_inputs

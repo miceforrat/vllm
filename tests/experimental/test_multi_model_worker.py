@@ -4,19 +4,20 @@ import asyncio
 from typing import Any
 
 import vllm.experimental.multi_model_worker as multi_model_worker
+from vllm.experimental.communicator_registry import CommunicatorRegistry
 from vllm.experimental.model_instance_registry import (
     ModelInstance,
     ModelInstanceRegistry,
 )
+from vllm.experimental.multi_model_topology import TopologyPlan, TopologyPlanner
 from vllm.experimental.multi_model_worker import (
     AsyncWorkerHostedRunnerClient,
     CommunicationGroupSpec,
     ModelSpec,
     MultiModelWorkerExtension,
+    SchedulerModelRequest,
     WorkerHostedRunnerClient,
 )
-
-
 
 
 class _FakeParallelConfig:
@@ -32,6 +33,9 @@ class _FakeEngine:
     def __init__(self, replies: dict[str, list[Any]]):
         self.replies = replies
         self.vllm_config = _FakeVllmConfig()
+        self.multi_model_topology_planner = TopologyPlanner(
+            self.vllm_config.parallel_config
+        )
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
 
     def collective_rpc(
@@ -85,6 +89,55 @@ def test_client_submits_serializable_model_spec() -> None:
     assert args[0]["backend_options"]["cache_backend"] == "sea_cache"
 
 
+def test_submit_routes_primary_model_to_scheduler_frontend() -> None:
+    engine = _FakeEngine({})
+
+    class _Frontend:
+        llm_engine = engine
+
+        def generate(self, prompt: Any, params: Any, **kwargs: Any) -> list[Any]:
+            assert prompt == ["hello"]
+            assert params == "sampling"
+            assert kwargs == {"use_tqdm": False}
+            return ["reasoner-output"]
+
+    client = WorkerHostedRunnerClient(_Frontend())
+    future = client.submit(
+        "reasoner",
+        SchedulerModelRequest(
+            prompt=["hello"],
+            sampling_params="sampling",
+            request_id="request-1",
+            generate_kwargs={"use_tqdm": False},
+        ),
+    )
+
+    assert future.result() == ["reasoner-output"]
+    assert engine.calls == []
+
+
+def test_submit_routes_runtime_model_to_worker_rpc() -> None:
+    engine = _FakeEngine(
+        {
+            "start_auxiliary_runner": [
+                {"job_id": "unused", "started": True}
+            ]
+        }
+    )
+    client = WorkerHostedRunnerClient(engine)
+    client._runtime_model_specs["generator-a"] = ModelSpec(
+        "generator-a", "generator", "vllm_omni"
+    )
+
+    # Keep the assertion independent of the randomly generated job id.
+    engine.collective_rpc = lambda method, *, args: [
+        {"job_id": args[3], "started": True}
+    ]
+    future = client.submit("generator-a", "generator-request")
+
+    assert future.model_id == "generator-a"
+
+
 def test_worker_skips_model_not_placed_on_its_rank() -> None:
     worker = MultiModelWorkerExtension()
     worker.rank = 2
@@ -97,7 +150,12 @@ def test_worker_skips_model_not_placed_on_its_rank() -> None:
             capabilities=("text_to_video",),
             default_task="text_to_video",
             worker_ranks=(0, 1),
-        ).to_rpc_payload()
+        ).to_rpc_payload(),
+        TopologyPlan(
+            model_id="generator-a",
+            worker_ranks=(0, 1),
+            communication_groups=(),
+        ).to_rpc_payload(),
     )
 
     assert result == {"model_id": "generator-a", "active": False, "rank": 2}
@@ -283,6 +341,31 @@ def test_async_client_starts_and_collects_external_job(monkeypatch) -> None:
     ]
 
 
+def test_async_submit_routes_primary_model_to_async_llm() -> None:
+    class _AsyncFrontend(_FakeAsyncEngine):
+        async def generate(self, **kwargs: Any):
+            assert kwargs["prompt"] == "hello"
+            assert kwargs["sampling_params"] == "sampling"
+            assert kwargs["request_id"] == "request-1"
+            yield "partial"
+            yield "final"
+
+    client = AsyncWorkerHostedRunnerClient(_AsyncFrontend({}))
+
+    async def exercise() -> None:
+        future = await client.submit(
+            "reasoner",
+            SchedulerModelRequest(
+                prompt="hello",
+                sampling_params="sampling",
+                request_id="request-1",
+            ),
+        )
+        assert await future.result() == "final"
+
+    asyncio.run(exercise())
+
+
 
 def test_model_spec_restores_nested_communication_groups() -> None:
     original = ModelSpec(
@@ -355,25 +438,26 @@ def test_worker_group_registry_reuses_and_releases_by_owner() -> None:
         def destroy(self) -> None:
             self.destroy_count += 1
 
-    worker = MultiModelWorkerExtension()
     spec = CommunicationGroupSpec(
         group_id="shared-tp",
         parallel_dimension="tp",
         ranks=(0, 1),
     )
     group = _FakeGroup()
-    from vllm.experimental.multi_model_worker import _CommunicationGroupSlot
+    registry = CommunicatorRegistry(group_factory=lambda _: group)
 
-    worker._vllm_communication_group_slots = {
-        spec.group_id: _CommunicationGroupSlot(spec, group, {"runner-a"})
-    }
-
-    assert worker._acquire_communication_group(spec, "runner-b") is group
-    worker._release_communication_groups("runner-a", (spec.group_id,))
+    assert registry.acquire(spec, "runner-a") is group
+    assert registry.acquire(spec, "runner-b") is group
+    registry.release("runner-a", (spec.group_id,))
     assert group.destroy_count == 0
-    worker._release_communication_groups("runner-b", (spec.group_id,))
+    registry.release("runner-b", (spec.group_id,))
     assert group.destroy_count == 1
-    assert worker._communication_group_slots() == {}
+    try:
+        registry.get(spec.group_id)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("Released communicator remained registered")
 
 
 def test_client_derives_homogeneous_tp_topology_from_engine() -> None:
@@ -391,9 +475,11 @@ def test_client_derives_homogeneous_tp_topology_from_engine() -> None:
 
     client.register(spec)
 
-    payload = engine.calls[0][1][0]
-    assert payload["worker_ranks"] == (0, 1)
-    assert payload["communication_groups"] == (
+    spec_payload, topology_payload = engine.calls[0][1]
+    assert spec_payload["worker_ranks"] == ()
+    assert spec_payload["communication_groups"] == ()
+    assert topology_payload["worker_ranks"] == (0, 1)
+    assert topology_payload["communication_groups"] == (
         {
             "group_id": "generator-b-tp",
             "parallel_dimension": "tp",

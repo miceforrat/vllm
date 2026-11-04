@@ -84,7 +84,7 @@ MultiModelGPUWorker                                     本项目新增 Worker �
   |-- primary model_runner: GPUModelRunner              原生 Reasoner
   |-- GreenContextPair                                  互补 SM 分区
   |-- MultiModelResourceArbiter                         动态资源仲裁
-  |-- ReasonerGraphVariantRegistry                      shared/full Graph 变体
+  |-- ModelGraphVariantManager                          shared/full Graph 变体
   `-- MultiModelWorkerExtension                         注入式多 Runner RPC 能力
         |
         | register_model(ModelSpec)
@@ -120,9 +120,9 @@ MultiModelGPUWorker                                     本项目新增 Worker �
 入口脚本顶部构造原生 Omni 请求：
 
 - [`make_generator_request()`](../../../examples/offline_inference/omni_worker_async_gate.py#L36)：生成 `OmniDiffusionRequest`；
-- [`run_reasoner()`](../../../examples/offline_inference/omni_worker_async_gate.py#L59)：通过 `AsyncLLM.generate()` 提交 Reasoner。
+- [`run_reasoner()`](../../../examples/offline_inference/omni_worker_async_gate.py)：构造 `SchedulerModelRequest`，通过统一 `submit(model_id, request)` 提交 Reasoner。
 
-请求协议仍由各自框架拥有。脚本没有发明统一 tensor request，而是在共同 Worker 之上保留两种 Runner 的请求契约。
+请求协议仍由各自框架拥有。统一的是控制入口和 request handle，而不是强行把 LLM 与 Diffusion payload 改成相同结构。
 
 ### 2.3 `AsyncEngineArgs` 分成两层
 
@@ -195,7 +195,7 @@ AsyncLLM.from_vllm_config()
 
 - Green Context pair 和四种执行 stream；
 - `MultiModelResourceArbiter`；
-- `ReasonerGraphVariantRegistry`；
+- `ModelGraphVariantManager`；
 - Graph pool/buffer/capture mode；
 - stream 切换、Graph 切换和启动观测计数器。
 
@@ -247,11 +247,12 @@ AOT 编译代码可以跨 stream 复用，但 CUDA Graph executable 绑定捕获
 
 ### 4.2 单一 vLLM capture trigger
 
-[`compile_or_warm_up_model()`](../../../vllm/experimental/multi_model_gpu_worker.py#L375) 没有在脚本外另跑一次捕获。它临时包装原生 `runner.capture_model`，让 vLLM 的一次原生 capture trigger 依次完成两个资源变体：
+[`compile_or_warm_up_model()`](../../../vllm/experimental/multi_model_gpu_worker.py) 没有在脚本外另跑一次捕获。Worker 把 `ModelGraphVariantManager` 安装为 Runner 的正式 capture provider；vLLM 的一次原生 capture trigger 依次完成两个资源变体：
 
 ```text
 vLLM compile_or_warm_up_model()
   -> runner.capture_model()                    单一原生触发点
+       -> graph_variant_capture_provider.capture_all()
        -> capture shared
        -> register shared
        -> capture reasoner_full
@@ -275,7 +276,9 @@ vLLM compile_or_warm_up_model()
 
 ### 4.4 Graph registry
 
-[`ReasonerGraphVariantRegistry`](../../../vllm/experimental/reasoner_graph_variants.py#L23) 保存每个变体的：
+[`ModelGraphVariantManager`](../../../vllm/experimental/reasoner_graph_variants.py) 是安装在 Runner 上的稳定 manager facade，统一提供 capture/register/activate/lifecycle；底层每个资源变体仍保存独立的 native CUDA Graph executable manager。
+
+它保存每个变体的：
 
 - 名称；
 - stream；
@@ -283,7 +286,7 @@ vLLM compile_or_warm_up_model()
 - PIECEWISE wrapper entry dictionaries；
 - capture 数量。
 
-[`activate()`](../../../vllm/experimental/reasoner_graph_variants.py#L56) 在运行前切换 `runner.cudagraph_manager`；PIECEWISE 模式还会切换 wrapper 的 concrete entry registry。Registry 管的是生命周期和选择，不声称两套 CUDA Graph executable 可以合并成一个。
+[`activate()`](../../../vllm/experimental/reasoner_graph_variants.py) 只切换 facade 内部的 active variant，`runner.cudagraph_manager` 始终指向同一个 facade；PIECEWISE 模式还会切换 wrapper 的 concrete entry registry。Manager 管的是统一生命周期和选择，不声称不同 stream/context 的 CUDA Graph executable 可以合并成同一份 executable。
 
 ### 4.5 三种统一 capture mode
 
@@ -319,15 +322,19 @@ registered = await client.register(spec)
 
 ### 5.2 Engine-side 同构 TP 规划
 
-[`WorkerHostedRunnerClient._plan_homogeneous_tp()`](../../../vllm/experimental/multi_model_worker.py#L547) 从所属 Engine 的 `parallel_config` 读取 TP/PP，并生成 `CommunicationGroupSpec`。
+[`TopologyPlanner`](../../../vllm/experimental/multi_model_topology.py) 在
+`LLMEngine/AsyncLLM` 初始化时由 Engine 的 `parallel_config` 构造。它生成
+独立、可序列化的 `TopologyPlan`，其中包含 placement ranks 与
+`CommunicationGroupSpec`。Frontend client 不再反向读取
+`llm_engine.vllm_config.parallel_config`，只调用所属 Engine 暴露的 planner。
 
 当前 Gate 的约束是：
 
 - PP=1；
 - Generator placement 与 Reasoner TP ranks 完全一致；
-- Engine/client 决定拓扑描述，Worker 不反向依赖 Executor 对象。
+- Engine 决定拓扑描述，Worker 不反向依赖 Engine/Executor 对象。
 
-随后 [`AsyncWorkerHostedRunnerClient.register()`](../../../vllm/experimental/multi_model_worker.py#L741) 通过原生 `AsyncLLM.collective_rpc()` 把相同部署描述发给各 Worker。Executor/RPC 分发属于 vLLM 原生能力。
+随后 [`AsyncWorkerHostedRunnerClient.register()`](../../../vllm/experimental/multi_model_worker.py) 将 `ModelSpec` 与 `TopologyPlan` 作为两个显式 payload，通过原生 `AsyncLLM.collective_rpc()` 沿 Engine/Executor RPC 路径发给各 Worker。Executor/RPC 分发属于 vLLM 原生能力。
 
 ### 5.3 Worker-side ModelInstanceRegistry
 
@@ -341,13 +348,13 @@ registered = await client.register(spec)
 4. 获取/创建辅助 TP communicator；
 5. 在现有 Worker 上启动原版 Omni Runner；
 6. 注入 Generator execution stream 和 phase selector；
-7. 把对象存入 `_RunnerSlot`。
+7. 把对象存入 `ModelInstanceRegistry`。
 
 `MultiModelWorkerExtension` 不是第二个 Worker，也不执行调度；它是注入现有 Worker 的 Runner/communicator registry 和 RPC surface。
 
 ### 5.4 辅助 communicator
 
-[`_acquire_communication_group()`](../../../vllm/experimental/multi_model_worker.py#L440) 使用 vLLM `init_model_parallel_group()` 创建 Runner-owned TP group；[`_release_communication_groups()`](../../../vllm/experimental/multi_model_worker.py#L483) 用 owner 引用计数销毁。
+Worker 持有独立的 [`CommunicatorRegistry`](../../../vllm/experimental/communicator_registry.py)。它消费 Engine 下发的 `CommunicationGroupSpec`，使用 vLLM `init_model_parallel_group()` 物化本进程的 group handle，并按 `group_id + owner` 复用、引用计数和销毁。Runner 只拿到 group handle，不创建 topology，也不读取 Engine/Executor。
 
 当前选择“相同 ranks、独立 communicator”，原因是 Runner 可能有独立 collective 顺序和生命周期。尚未实现多个交叉 communicator 的 distributed turnstile，因此当前支持范围仍是同构 TP Gate，不应外推为任意异构并行安全。
 
@@ -394,23 +401,24 @@ registered = await client.register(spec)
 
 ## 7. 请求运行：Generator 和 Reasoner 如何异步进入同一 Worker
 
-### 7.1 Generator 异步提交
+### 7.1 统一提交入口
 
 脚本通过：
 
 ```python
-generator_future = await client.start_async(model_id, request)
+future = await client.submit(model_id, request)
 ```
 
 调用链为：
 
 ```text
-AsyncWorkerHostedRunnerClient.start_async()
-  -> AsyncLLM.collective_rpc("start_auxiliary_runner")
-  -> each Worker: MultiModelWorkerExtension.start_auxiliary_runner()
-  -> Worker-local long-lived ThreadPoolExecutor
-  -> EmbeddedOmniDiffusionRunner.execute_model()
-  -> Omni DiffusionModelRunner.execute_model()
+AsyncWorkerHostedRunnerClient.submit(model_id, request)
+  |-- scheduler_managed model
+  |     -> AsyncLLM.generate() -> EngineCore Scheduler
+  `-- runtime_added model
+        -> collective_rpc("start_auxiliary_runner")
+        -> Worker-local ThreadPoolExecutor
+        -> Omni DiffusionModelRunner.execute_model()
 ```
 
 异步 client 和 future 位于：
@@ -424,13 +432,7 @@ AsyncWorkerHostedRunnerClient.start_async()
 
 ### 7.2 Reasoner admission 和请求提交
 
-动态调度时，脚本先调用：
-
-```python
-await client.set_primary_demand(True)
-```
-
-被 admission 后才创建 `run_reasoner()` task。请求结束后在 `finally` 中释放 demand。完整并发编排见 [`omni_worker_async_gate.py:414-480`](../../../examples/offline_inference/omni_worker_async_gate.py#L414)。
+动态调度时，`submit()` 在进入 `AsyncLLM.generate()` 前申请 primary demand，并在请求 task 的 `finally` 中释放。调用脚本不再直接操作 arbiter admission。
 
 Reasoner 请求本身仍走 vLLM 原生：
 
@@ -560,7 +562,8 @@ slot 只有在 D2H copy 完成并被 `get_output()` 消费后才归还。pool �
 | 统一模型描述与实例 registry | [`ModelSpec/ModelInstanceRegistry`](../../../vllm/experimental/model_instance_registry.py) | 同时描述主模型与运行时追加模型，管理能力、placement 和生命周期 |
 | Worker 模型注册/RPC | [`MultiModelWorkerExtension`](../../../vllm/experimental/multi_model_worker.py) | 注册、执行、异步 job、收集和关闭运行时追加的 Omni Runner |
 | 同步/异步前端 client | [`WorkerHostedRunnerClient`](../../../vllm/experimental/multi_model_worker.py#L537)、[`AsyncWorkerHostedRunnerClient`](../../../vllm/experimental/multi_model_worker.py#L731) | 经 Engine collective RPC 控制 Worker-hosted Runner |
-| 辅助通信组 registry | [`_acquire_communication_group()`](../../../vllm/experimental/multi_model_worker.py#L440) | Engine 描述拓扑，Worker 创建/引用计数/销毁 communicator |
+| Engine topology planner | [`TopologyPlanner/TopologyPlan`](../../../vllm/experimental/multi_model_topology.py) | Engine 根据 parallel config 生成显式 placement 与通信域计划 |
+| Worker communicator registry | [`CommunicatorRegistry`](../../../vllm/experimental/communicator_registry.py) | Worker 消费计划并创建、复用、引用计数和销毁 communicator |
 | 多模型 GPU Worker | [`MultiModelGPUWorker`](../../../vllm/experimental/multi_model_gpu_worker.py#L131) | 共同物理资源所有者和执行覆写入口 |
 | 互补 SM 分区 | [`GreenContextPair`](../../../vllm/experimental/green_context.py#L132) | 同一 GPU 上创建不重叠 GC streams |
 | 动态资源仲裁 | [`MultiModelResourceArbiter`](../../../vllm/experimental/multi_model_arbiter.py#L46) | 在 full/shared 三状态间按安全边界切换 |
