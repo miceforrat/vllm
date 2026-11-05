@@ -57,6 +57,7 @@ from vllm.v1.core.kv_cache_utils import (
     update_kv_cache_capacity,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.execution_units import ExecutionUnitAdmissionServer
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
@@ -125,6 +126,11 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        from vllm.experimental.model_instance_registry import (
+            restore_engine_model_registry,
+        )
+
+        self.model_registry = restore_engine_model_registry(vllm_config)
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -174,6 +180,32 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        self.execution_unit_server: ExecutionUnitAdmissionServer | None = None
+        additional = getattr(vllm_config, "additional_config", None)
+        runtime = (
+            additional.get("multi_model_runtime", {})
+            if isinstance(additional, dict)
+            else {}
+        )
+        green_context = (
+            runtime.get("green_context", {})
+            if isinstance(runtime, dict)
+            else {}
+        )
+        if (
+            isinstance(green_context, dict)
+            and green_context.get("partition_policy") == "dynamic"
+        ):
+            self.execution_unit_server = ExecutionUnitAdmissionServer(
+                self.scheduler.execution_units
+            )
+            self.model_executor.collective_rpc(
+                "configure_execution_unit_scheduler",
+                args=(
+                    self.execution_unit_server.address,
+                    self.execution_unit_server.authkey.hex(),
+                ),
+            )
         self._initialize_effective_attention_block_size()
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
@@ -795,6 +827,9 @@ class EngineCore:
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
         self.structured_output_manager.clear_backend()
+        if self.execution_unit_server is not None:
+            self.execution_unit_server.close()
+            self.execution_unit_server = None
         if self.model_executor:
             self.model_executor.shutdown()
         if self.scheduler:
@@ -1035,6 +1070,68 @@ class EngineCore:
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+
+    def register_model_spec(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Commit one successfully deployed model to the Engine registry."""
+        from vllm.experimental.model_instance_registry import ModelSpec
+
+        spec = ModelSpec.from_rpc_payload(payload)
+        self.model_registry.register(spec)
+        return self.model_registry_state()
+
+    def remove_model_spec(self, model_id: str) -> dict[str, Any]:
+        self.model_registry.remove(model_id)
+        return self.model_registry_state()
+
+    def model_registry_state(self) -> dict[str, Any]:
+        return {
+            "default_model_id": self.model_registry.default_model_id,
+            "models": [
+                spec.to_rpc_payload() for spec in self.model_registry.values()
+            ],
+        }
+
+    def register_execution_request(
+        self,
+        model_id: str,
+        request_id: str,
+        units: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return self.scheduler.execution_units.register_request(
+            model_id, request_id, units
+        )
+
+    def set_execution_primary_demand(self, active: bool) -> dict[str, Any]:
+        return self.scheduler.execution_units.set_primary_demand(active)
+
+    def offer_execution_unit(
+        self,
+        model_id: str,
+        request_id: str,
+        unit: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.scheduler.execution_units.offer_unit(
+            model_id, request_id, unit
+        )
+
+    def admit_execution_unit(self, request_id: str) -> dict[str, Any]:
+        return self.scheduler.execution_units.admit_next(request_id)
+
+    def start_execution_unit(self, request_id: str) -> dict[str, Any]:
+        return self.scheduler.execution_units.start_unit(request_id)
+
+    def complete_execution_unit(
+        self, request_id: str, failed: bool = False
+    ) -> dict[str, Any]:
+        return self.scheduler.execution_units.complete_unit(
+            request_id, failed=failed
+        )
+
+    def remove_execution_request(self, request_id: str) -> dict[str, Any]:
+        return self.scheduler.execution_units.remove_request(request_id)
+
+    def execution_unit_state(self) -> dict[str, Any]:
+        return self.scheduler.execution_units.snapshot()
 
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version

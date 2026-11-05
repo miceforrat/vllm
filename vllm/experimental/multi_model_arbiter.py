@@ -168,6 +168,7 @@ class MultiModelResourceArbiter:
             with self._condition:
                 if self._pending_generator_completion is completion:
                     self._pending_generator_completion = None
+                self._condition.notify_all()
 
     def release_primary_demand(self) -> None:
         with self._condition:
@@ -241,6 +242,7 @@ class MultiModelResourceArbiter:
         self,
         phase: GeneratorExecutionPhase | str,
         step_index: int | None = None,
+        selected_mode: str | None = None,
     ) -> GeneratorPhaseLease | None:
         phase = GeneratorExecutionPhase(phase)
         completion = None
@@ -265,20 +267,43 @@ class MultiModelResourceArbiter:
                 self._generator_request_active = True
                 if self._active_generator_lease is not None:
                     raise RuntimeError("A Generator phase lease is already active")
-                if (
+                if selected_mode is not None and selected_mode not in {
+                    "shared",
+                    "generator_full",
+                }:
+                    raise ValueError(
+                        f"Unsupported Generator execution mode: {selected_mode!r}"
+                    )
+                mode = selected_mode
+                if mode is None and (
                     self._generator_phase_policy == "fixed_shared"
                     or self._primary_demand
                 ):
                     mode = "shared"
+                elif mode is None:
+                    mode = "generator_full"
+                if mode == "shared":
+                    mode = "shared"
                     stream = self._shared_generator_stream
                     self._shared_steps += 1
                 else:
-                    mode = "generator_full"
                     stream = self._full_generator_stream
                     self._full_steps += 1
                 pending = self._pending_generator_completion
                 if pending is not None and pending[3] != mode:
-                    completion = pending
+                    if (
+                        pending[3] == "generator_full"
+                        and self._primary_demand > 0
+                    ):
+                        # Primary admission is the unique owner of the
+                        # full->shared handoff drain.  Do not synchronize the
+                        # same CUDA event concurrently from both host threads:
+                        # wait until acquire_primary_demand() publishes that
+                        # the event has drained and clears the handoff.
+                        while self._pending_generator_completion is pending:
+                            self._condition.wait()
+                    else:
+                        completion = pending
                 lease = GeneratorPhaseLease(
                     stream, mode, phase, step_index, self
                 )

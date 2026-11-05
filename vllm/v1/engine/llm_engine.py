@@ -67,6 +67,13 @@ class LLMEngine:
         self.multi_model_topology_planner = TopologyPlanner(
             vllm_config.parallel_config
         )
+        from vllm.experimental.model_instance_registry import (
+            create_engine_model_registry,
+        )
+
+        self.model_registry = create_engine_model_registry(
+            vllm_config, self.multi_model_topology_planner
+        )
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
 
@@ -449,6 +456,14 @@ class LLMEngine:
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
+
+    def execution_unit_rpc(self, method: str, *args: Any) -> Any:
+        """Call an EngineCore execution-unit scheduling method."""
+        return self.engine_core.call_utility(method, *args)
+
+    def model_registry_rpc(self, method: str, *args: Any) -> Any:
+        """Call an EngineCore model-registry lifecycle method."""
+        return self.engine_core.call_utility(method, *args)
 
     def set_weight_version(self, weight_version: str) -> None:
         self.engine_core.set_weight_version(weight_version)

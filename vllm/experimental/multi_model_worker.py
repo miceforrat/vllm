@@ -17,9 +17,11 @@ from vllm.experimental.model_instance_registry import (
     CommunicationGroupSpec,
     ModelInstance,
     ModelInstanceRegistry,
+    ModelRegistry,
     ModelSpec,
 )
 from vllm.experimental.multi_model_topology import TopologyPlan
+from vllm.experimental.runner_factory import RunnerFactory
 
 
 @dataclass(frozen=True)
@@ -37,41 +39,20 @@ class MultiModelWorkerExtension:
 
     def _model_instance_registry(self) -> ModelInstanceRegistry:
         registry = getattr(self, "_vllm_model_instance_registry", None)
-        if registry is not None:
-            return registry
-
-        from vllm.distributed.parallel_state import get_tp_group
-
-        registry = ModelInstanceRegistry()
-        config = getattr(self, "vllm_config", None)
-        additional = getattr(config, "additional_config", None)
-        runtime = (
-            additional.get("multi_model_runtime", {})
-            if isinstance(additional, dict)
-            else {}
-        )
-        primary_model_id = str(runtime.get("primary_model_id", "reasoner"))
-        model_config = getattr(self, "model_config", None)
-        model_path = str(getattr(model_config, "model", primary_model_id))
-        tp_ranks = tuple(int(rank) for rank in get_tp_group().ranks)
-        primary_spec = ModelSpec(
-            model_id=primary_model_id,
-            model_path=model_path,
-            backend="vllm",
-            capabilities=("text_generation",),
-            default_task="text_generation",
-            worker_ranks=tp_ranks,
-        )
-        registry.register(
-            ModelInstance(
-                spec=primary_spec,
-                runner=self.model_runner,
-                scheduler_managed=True,
-                runtime_added=False,
+        if registry is None:
+            raise RuntimeError(
+                "The Worker must create its ModelInstanceRegistry before "
+                "materializing any model Runner"
             )
-        )
-        self._vllm_model_instance_registry = registry
         return registry
+
+    def configure_execution_unit_scheduler(
+        self, address: str, authkey_hex: str
+    ) -> None:
+        self._vllm_execution_unit_scheduler_endpoint = (
+            address,
+            authkey_hex,
+        )
 
     @staticmethod
     def _describe_group(group: Any) -> dict[str, Any]:
@@ -128,89 +109,7 @@ class MultiModelWorkerExtension:
         registry = self._model_instance_registry()
         if spec.model_id in registry:
             raise ValueError(f"Model {spec.model_id!r} is already registered")
-        if spec.backend != "vllm_omni":
-            raise ValueError(f"Unsupported auxiliary backend: {spec.backend!r}")
-
-        from vllm.distributed.parallel_state import get_tp_group
-
-        # 目前只支持同态TP
-        tp_ranks = tuple(int(rank) for rank in get_tp_group().ranks)
-        if tuple(spec.worker_ranks) != tp_ranks:
-            raise ValueError(
-                "The homogeneous TP gate requires Generator placement to match "
-                f"the vLLM TP group exactly: placement={spec.worker_ranks}, "
-                f"tp={tp_ranks}"
-            )
-
-        tp_specs = tuple(
-            group
-            for group in spec.communication_groups
-            if group.parallel_dimension == "tp"
-        )
-        if len(tp_specs) != 1:
-            raise ValueError(
-                "An auxiliary runner requires exactly one Engine-planned TP "
-                f"communication group, got {len(tp_specs)}"
-            )
-        tp_spec = tp_specs[0]
-        if tuple(tp_spec.ranks) != tp_ranks:
-            raise ValueError(
-                "The homogeneous TP gate requires the Engine-planned group "
-                f"to match vLLM TP ranks: planned={tp_spec.ranks}, tp={tp_ranks}"
-            )
-
-        from vllm.experimental.omni_runner_adapter import (
-            EmbeddedOmniDiffusionRunner,
-            resolve_omni_diffusion_stage,
-        )
-
-        resolved = resolve_omni_diffusion_stage(
-            spec.model_path,
-            cli_overrides=spec.backend_options,
-        )
-        # 创建辅助runner
-        adapter = EmbeddedOmniDiffusionRunner(
-            resolved,
-            device=str(self.device),
-            memory_pool_tag_prefix=spec.model_id,
-        )
-        tp_group = None
-        try:
-            tp_group = self._communicator_registry().acquire(
-                tp_spec, spec.model_id
-            )
-            runner = adapter.start_on_worker(
-                self,
-                tp_group=tp_group,
-                load_format=spec.load_format,
-            )
-            execution_stream = getattr(
-                self, "_multi_model_generator_stream", None
-            )
-            if execution_stream is not None:
-                adapter.set_execution_stream(execution_stream)
-            phase_selector = (
-                getattr(self, "acquire_generator_phase_lease", None)
-                if getattr(self, "_multi_model_resource_arbiter", None)
-                is not None
-                else None
-            )
-            if phase_selector is not None:
-                adapter.set_generator_phase_stream_selector(phase_selector)
-        except Exception:
-            adapter.close()
-            if tp_group is not None:
-                self._communicator_registry().release(
-                    spec.model_id, (tp_spec.group_id,)
-                )
-            raise
-        instance = ModelInstance(
-            spec=spec,
-            adapter=adapter,
-            runner=runner,
-            runtime_added=True,
-            communication_group_ids=(tp_spec.group_id,),
-        )
+        instance = self._runner_factory().create(spec)
         registry.register(instance)
         return self._describe_model_instance(instance)
 
@@ -435,14 +334,7 @@ class MultiModelWorkerExtension:
                 slot.pending_start = None
                 slot.pending_started = None
                 slot.pending_job_id = None
-            # Drop the registry's duplicate runner reference before adapter
-            # teardown.  This lets the runner/pipeline destruct while the Omni
-            # compatibility group views are still installed.
-            slot.runner = None
-            slot.adapter.close()
-            self._communicator_registry().release(
-                slot.spec.model_id, slot.communication_group_ids
-            )
+            self._runner_factory().destroy(slot)
             registry.remove(slot.spec.model_id)
         pool = getattr(self, "_vllm_auxiliary_thread_pool", None)
         if pool is not None:
@@ -456,6 +348,13 @@ class MultiModelWorkerExtension:
             registry = CommunicatorRegistry()
             self._vllm_communicator_registry = registry
         return registry
+
+    def _runner_factory(self) -> RunnerFactory:
+        factory = getattr(self, "_vllm_runner_factory", None)
+        if factory is None:
+            factory = RunnerFactory(self, self._communicator_registry())
+            self._vllm_runner_factory = factory
+        return factory
 
     def _auxiliary_runner_slots(self) -> dict[str, ModelInstance]:
         """Compatibility view containing only runtime-added models."""
@@ -518,7 +417,12 @@ class WorkerHostedRunnerClient:
     def __init__(self, model_frontend: Any):
         self._model_frontend = model_frontend
         self._llm_engine = getattr(model_frontend, "llm_engine", model_frontend)
-        self._runtime_model_specs: dict[str, ModelSpec] = {}
+        registry = getattr(self._llm_engine, "model_registry", None)
+        if not isinstance(registry, ModelRegistry):
+            raise RuntimeError(
+                "The owning Engine must provide an Engine-owned ModelRegistry"
+            )
+        self._model_registry = registry
 
     def _runtime_config(self) -> Mapping[str, Any]:
         config = getattr(self._llm_engine, "vllm_config", None)
@@ -529,8 +433,9 @@ class WorkerHostedRunnerClient:
         return runtime if isinstance(runtime, Mapping) else {}
 
     @property
-    def primary_model_id(self) -> str:
-        return str(self._runtime_config().get("primary_model_id", "reasoner"))
+    def default_model_id(self) -> str:
+        """Return the Engine registry's default routing target."""
+        return self._model_registry.default_model_id
 
     def _dynamic_arbitration_enabled(self) -> bool:
         green_context = self._runtime_config().get("green_context", {})
@@ -547,12 +452,11 @@ class WorkerHostedRunnerClient:
         profile_memory: bool = False,
     ) -> "ModelRequestFuture":
         """Submit one request without exposing the model's execution owner."""
-        if model_id in self._runtime_model_specs:
+        spec = self._model_registry.get(model_id)
+        if spec.backend != "vllm":
             return self.start_async(
                 model_id, request, profile_memory=profile_memory
             )
-        if model_id != self.primary_model_id:
-            raise KeyError(f"Unknown model: {model_id!r}")
         if not isinstance(request, SchedulerModelRequest):
             raise TypeError(
                 "Scheduler-managed models require SchedulerModelRequest"
@@ -564,10 +468,17 @@ class WorkerHostedRunnerClient:
                 "only its llm_engine"
             )
         dynamic = self._dynamic_arbitration_enabled()
+        submit_started = time.perf_counter()
+        timing: dict[str, float] = {}
+        admission_started = time.perf_counter()
         if dynamic:
             self.set_primary_demand(True)
+        timing["admission_wait_seconds"] = (
+            time.perf_counter() - admission_started
+        )
 
         future: Future[Any] = Future()
+        execution_started = time.perf_counter()
         try:
             future.set_result(
                 generate(
@@ -579,9 +490,21 @@ class WorkerHostedRunnerClient:
         except BaseException as exc:
             future.set_exception(exc)
         finally:
+            timing["model_execution_seconds"] = (
+                time.perf_counter() - execution_started
+            )
+            release_started = time.perf_counter()
             if dynamic:
                 self.set_primary_demand(False)
-        return SchedulerModelFuture(model_id, request.request_id, future)
+            timing["demand_release_seconds"] = (
+                time.perf_counter() - release_started
+            )
+            timing["submit_total_seconds"] = (
+                time.perf_counter() - submit_started
+            )
+        return SchedulerModelFuture(
+            model_id, request.request_id, future, timing=timing
+        )
 
     def register(self, spec: ModelSpec) -> list[dict[str, Any]]:
         plan = self._topology_planner().plan(spec)
@@ -589,7 +512,13 @@ class WorkerHostedRunnerClient:
         result = self._rpc(
             "register_model", spec.to_rpc_payload(), plan.to_rpc_payload()
         )
-        self._runtime_model_specs[spec.model_id] = planned
+        registry_rpc = getattr(self._llm_engine, "model_registry_rpc", None)
+        if registry_rpc is None:
+            raise RuntimeError(
+                "The owning Engine does not expose model-registry lifecycle RPC"
+            )
+        registry_rpc("register_model_spec", planned.to_rpc_payload())
+        self._model_registry.register(planned)
         return result
 
     def _topology_planner(self) -> Any:
@@ -712,12 +641,35 @@ class WorkerHostedRunnerClient:
     def resource_plan(self) -> list[dict[str, Any]]:
         return self._rpc("multi_model_resource_plan")
 
+    def execution_unit_state(self) -> dict[str, Any]:
+        utility = getattr(self._llm_engine, "execution_unit_rpc", None)
+        if utility is None:
+            raise RuntimeError("The owning Engine has no execution-unit API")
+        return utility("execution_unit_state")
+
     def set_primary_demand(self, active: bool) -> list[dict[str, Any]]:
-        return self._rpc("set_primary_model_demand", active)
+        utility = getattr(self._llm_engine, "execution_unit_rpc", None)
+        if utility is None:
+            return self._rpc("set_primary_model_demand", active)
+        if active:
+            utility("set_execution_primary_demand", True)
+            try:
+                return self._rpc("set_primary_model_demand", True)
+            except BaseException:
+                utility("set_execution_primary_demand", False)
+                raise
+        result = self._rpc("set_primary_model_demand", False)
+        utility("set_execution_primary_demand", False)
+        return result
 
     def close(self) -> list[list[str]]:
         result = self._rpc("close_auxiliary_runners")
-        self._runtime_model_specs.clear()
+        registry_rpc = getattr(self._llm_engine, "model_registry_rpc", None)
+        for spec in self._model_registry.values():
+            if spec.model_id != self._model_registry.default_model_id:
+                if registry_rpc is not None:
+                    registry_rpc("remove_model_spec", spec.model_id)
+                self._model_registry.remove(spec.model_id)
         return result
 
     def _rpc(self, method: str, *args: Any) -> list[Any]:
@@ -762,11 +714,22 @@ class SchedulerModelFuture:
     """Synchronous handle for one scheduler-managed model request."""
 
     def __init__(
-        self, model_id: str, request_id: str, future: Future[Any]
+        self,
+        model_id: str,
+        request_id: str,
+        future: Future[Any],
+        *,
+        timing: Mapping[str, float] | None = None,
     ) -> None:
         self.model_id = model_id
         self.request_id = request_id
         self._future = future
+        self._timing = dict(timing or {})
+
+    @property
+    def timing(self) -> dict[str, float]:
+        """Return host-side submission timing for this request."""
+        return dict(self._timing)
 
     def done(self) -> bool:
         return self._future.done()
@@ -793,7 +756,13 @@ class AsyncWorkerHostedRunnerClient(WorkerHostedRunnerClient):
         result = await self._rpc_async(
             "register_model", spec.to_rpc_payload(), plan.to_rpc_payload()
         )
-        self._runtime_model_specs[planned.model_id] = planned
+        registry_rpc = getattr(self._llm_engine, "model_registry_rpc", None)
+        if registry_rpc is None:
+            raise RuntimeError(
+                "The owning Engine does not expose model-registry lifecycle RPC"
+            )
+        await registry_rpc("register_model_spec", planned.to_rpc_payload())
+        self._model_registry.register(planned)
         return result
 
     async def submit(
@@ -804,22 +773,28 @@ class AsyncWorkerHostedRunnerClient(WorkerHostedRunnerClient):
         profile_memory: bool = False,
     ) -> "AsyncModelRequestFuture":
         """Submit to AsyncLLM or a Worker-hosted model through one entry."""
-        if model_id in self._runtime_model_specs:
+        spec = self._model_registry.get(model_id)
+        if spec.backend != "vllm":
             return await self.start_async(
                 model_id, request, profile_memory=profile_memory
             )
-        if model_id != self.primary_model_id:
-            raise KeyError(f"Unknown model: {model_id!r}")
         if not isinstance(request, SchedulerModelRequest):
             raise TypeError(
                 "Scheduler-managed models require SchedulerModelRequest"
             )
         dynamic = self._dynamic_arbitration_enabled()
+        submit_started = time.perf_counter()
+        timing: dict[str, float] = {}
+        admission_started = time.perf_counter()
         if dynamic:
             await self.set_primary_demand(True)
+        timing["admission_wait_seconds"] = (
+            time.perf_counter() - admission_started
+        )
 
         async def run() -> Any:
             final_output = None
+            execution_started = time.perf_counter()
             try:
                 async for output in self._model_frontend.generate(
                     prompt=request.prompt,
@@ -834,11 +809,23 @@ class AsyncWorkerHostedRunnerClient(WorkerHostedRunnerClient):
                     )
                 return final_output
             finally:
+                timing["model_execution_seconds"] = (
+                    time.perf_counter() - execution_started
+                )
+                release_started = time.perf_counter()
                 if dynamic:
                     await self.set_primary_demand(False)
+                timing["demand_release_seconds"] = (
+                    time.perf_counter() - release_started
+                )
+                timing["submit_total_seconds"] = (
+                    time.perf_counter() - submit_started
+                )
 
         task = asyncio.create_task(run())
-        return AsyncSchedulerModelFuture(model_id, request.request_id, task)
+        return AsyncSchedulerModelFuture(
+            model_id, request.request_id, task, timing=timing
+        )
 
     async def topology(
         self, worker_ranks: tuple[int, ...] = ()
@@ -933,14 +920,37 @@ class AsyncWorkerHostedRunnerClient(WorkerHostedRunnerClient):
     async def resource_plan(self) -> list[dict[str, Any]]:
         return await self._rpc_async("multi_model_resource_plan")
 
+    async def execution_unit_state(self) -> dict[str, Any]:
+        utility = getattr(self._llm_engine, "execution_unit_rpc", None)
+        if utility is None:
+            raise RuntimeError("The owning Engine has no execution-unit API")
+        return await utility("execution_unit_state")
+
     async def set_primary_demand(
         self, active: bool
     ) -> list[dict[str, Any]]:
-        return await self._rpc_async("set_primary_model_demand", active)
+        utility = getattr(self._llm_engine, "execution_unit_rpc", None)
+        if utility is None:
+            return await self._rpc_async("set_primary_model_demand", active)
+        if active:
+            await utility("set_execution_primary_demand", True)
+            try:
+                return await self._rpc_async("set_primary_model_demand", True)
+            except BaseException:
+                await utility("set_execution_primary_demand", False)
+                raise
+        result = await self._rpc_async("set_primary_model_demand", False)
+        await utility("set_execution_primary_demand", False)
+        return result
 
     async def close(self) -> list[list[str]]:
         result = await self._rpc_async("close_auxiliary_runners")
-        self._runtime_model_specs.clear()
+        registry_rpc = getattr(self._llm_engine, "model_registry_rpc", None)
+        for spec in self._model_registry.values():
+            if spec.model_id != self._model_registry.default_model_id:
+                if registry_rpc is not None:
+                    await registry_rpc("remove_model_spec", spec.model_id)
+                self._model_registry.remove(spec.model_id)
         return result
 
     async def _rpc_async(self, method: str, *args: Any) -> list[Any]:
@@ -995,11 +1005,22 @@ class AsyncSchedulerModelFuture:
     """Async handle for one scheduler-managed model request."""
 
     def __init__(
-        self, model_id: str, request_id: str, task: asyncio.Task[Any]
+        self,
+        model_id: str,
+        request_id: str,
+        task: asyncio.Task[Any],
+        *,
+        timing: dict[str, float] | None = None,
     ) -> None:
         self.model_id = model_id
         self.request_id = request_id
         self._task = task
+        self._timing = timing if timing is not None else {}
+
+    @property
+    def timing(self) -> dict[str, float]:
+        """Return currently available host-side submission timing."""
+        return dict(self._timing)
 
     async def done(self) -> bool:
         return self._task.done()

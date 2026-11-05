@@ -64,6 +64,21 @@ class TopologyPlanner:
         self._pp_size = int(parallel_config.pipeline_parallel_size)
 
     def plan(self, spec: ModelSpec) -> TopologyPlan:
+        if spec.backend == "vllm":
+            # Native vLLM already materializes its TP/PP communicators. The
+            # Engine plan still makes placement explicit, but must not create
+            # a second set of equivalent groups in the Worker registry.
+            ranks = tuple(range(self._tp_size * self._pp_size))
+            if spec.worker_ranks and tuple(spec.worker_ranks) != ranks:
+                raise ValueError(
+                    "Requested vLLM placement conflicts with Engine topology: "
+                    f"requested={spec.worker_ranks}, engine={ranks}"
+                )
+            return TopologyPlan(
+                model_id=spec.model_id,
+                worker_ranks=ranks,
+                communication_groups=spec.communication_groups,
+            )
         if self._pp_size != 1:
             raise ValueError(
                 "The homogeneous auxiliary-runner Gate currently requires PP=1, "

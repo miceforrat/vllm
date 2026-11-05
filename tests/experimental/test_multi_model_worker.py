@@ -8,6 +8,7 @@ from vllm.experimental.communicator_registry import CommunicatorRegistry
 from vllm.experimental.model_instance_registry import (
     ModelInstance,
     ModelInstanceRegistry,
+    ModelRegistry,
 )
 from vllm.experimental.multi_model_topology import TopologyPlan, TopologyPlanner
 from vllm.experimental.multi_model_worker import (
@@ -36,13 +37,27 @@ class _FakeEngine:
         self.multi_model_topology_planner = TopologyPlanner(
             self.vllm_config.parallel_config
         )
+        self.model_registry = ModelRegistry(default_model_id="reasoner")
+        self.model_registry.register(
+            self.multi_model_topology_planner.plan(
+                ModelSpec("reasoner", "model", "vllm")
+            ).apply(ModelSpec("reasoner", "model", "vllm")),
+            make_default=True,
+        )
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.registry_calls: list[tuple[str, tuple[Any, ...]]] = []
 
     def collective_rpc(
         self, method: str, *, args: tuple[Any, ...]
     ) -> list[Any]:
         self.calls.append((method, args))
         return self.replies[method]
+
+    def model_registry_rpc(self, method: str, *args: Any) -> dict[str, Any]:
+        self.registry_calls.append((method, args))
+        return {"models": [
+            spec.to_rpc_payload() for spec in self.model_registry.values()
+        ]}
 
 
 class _FakeAsyncEngine(_FakeEngine):
@@ -51,6 +66,11 @@ class _FakeAsyncEngine(_FakeEngine):
     ) -> list[Any]:
         self.calls.append((method, args))
         return self.replies[method]
+
+    async def model_registry_rpc(
+        self, method: str, *args: Any
+    ) -> dict[str, Any]:
+        return super().model_registry_rpc(method, *args)
 
 
 def test_client_submits_serializable_model_spec() -> None:
@@ -87,6 +107,21 @@ def test_client_submits_serializable_model_spec() -> None:
     assert args[0]["worker_ranks"] == (0, 1)
     assert args[0]["communication_groups"][0]["group_id"] == "generator-a-tp"
     assert args[0]["backend_options"]["cache_backend"] == "sea_cache"
+    assert client._model_registry.get("generator-a").backend == "vllm_omni"
+    assert engine.registry_calls[0][0] == "register_model_spec"
+
+
+def test_engine_registry_treats_startup_and_runtime_specs_uniformly() -> None:
+    registry = ModelRegistry(default_model_id="reasoner")
+    reasoner = ModelSpec("reasoner", "reasoner-model", "vllm")
+    generator = ModelSpec("generator", "generator-model", "vllm_omni")
+
+    registry.register(reasoner, make_default=True)
+    registry.register(generator)
+
+    assert registry.default_model_id == "reasoner"
+    assert registry.values() == (reasoner, generator)
+    assert registry.get("generator") is generator
 
 
 def test_submit_routes_primary_model_to_scheduler_frontend() -> None:
@@ -113,6 +148,20 @@ def test_submit_routes_primary_model_to_scheduler_frontend() -> None:
     )
 
     assert future.result() == ["reasoner-output"]
+    assert set(future.timing) == {
+        "admission_wait_seconds",
+        "model_execution_seconds",
+        "demand_release_seconds",
+        "submit_total_seconds",
+    }
+    assert future.timing["submit_total_seconds"] >= sum(
+        future.timing[name]
+        for name in (
+            "admission_wait_seconds",
+            "model_execution_seconds",
+            "demand_release_seconds",
+        )
+    )
     assert engine.calls == []
 
 
@@ -125,8 +174,8 @@ def test_submit_routes_runtime_model_to_worker_rpc() -> None:
         }
     )
     client = WorkerHostedRunnerClient(engine)
-    client._runtime_model_specs["generator-a"] = ModelSpec(
-        "generator-a", "generator", "vllm_omni"
+    client._model_registry.register(
+        ModelSpec("generator-a", "generator", "vllm_omni")
     )
 
     # Keep the assertion independent of the randomly generated job id.
@@ -362,6 +411,20 @@ def test_async_submit_routes_primary_model_to_async_llm() -> None:
             ),
         )
         assert await future.result() == "final"
+        assert set(future.timing) == {
+            "admission_wait_seconds",
+            "model_execution_seconds",
+            "demand_release_seconds",
+            "submit_total_seconds",
+        }
+        assert future.timing["submit_total_seconds"] >= sum(
+            future.timing[name]
+            for name in (
+                "admission_wait_seconds",
+                "model_execution_seconds",
+                "demand_release_seconds",
+            )
+        )
 
     asyncio.run(exercise())
 

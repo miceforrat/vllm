@@ -146,6 +146,124 @@ class ModelInstanceRegistry:
         with self._lock:
             return tuple(self._instances.values())
 
+    def drain(self) -> tuple[ModelInstance, ...]:
+        """Remove and return every instance for Worker-wide shutdown.
+
+        Runtime removal still goes through :meth:`remove` and therefore
+        cannot remove an Engine-owned startup model. Worker shutdown is the
+        one lifecycle boundary that owns every rank-local instance.
+        """
+        with self._lock:
+            instances = tuple(reversed(tuple(self._instances.values())))
+            self._instances.clear()
+            return instances
+
     def __contains__(self, model_id: str) -> bool:
         with self._lock:
             return model_id in self._instances
+
+
+class ModelRegistry:
+    """Engine-owned registry of every deployed model specification.
+
+    Unlike :class:`ModelInstanceRegistry`, this registry contains deployment
+    intent rather than rank-local Runner objects.  Startup and runtime-added
+    models enter through the same API; ``default_model_id`` is only a
+    compatibility routing default and does not grant a model special
+    lifecycle ownership.
+    """
+
+    def __init__(self, *, default_model_id: str | None = None) -> None:
+        self._specs: dict[str, ModelSpec] = {}
+        self._default_model_id = default_model_id
+        self._lock = threading.RLock()
+
+    @property
+    def default_model_id(self) -> str:
+        with self._lock:
+            if self._default_model_id is None:
+                raise RuntimeError("The Engine ModelRegistry has no default model")
+            return self._default_model_id
+
+    def register(self, spec: ModelSpec, *, make_default: bool = False) -> None:
+        with self._lock:
+            if spec.model_id in self._specs:
+                raise ValueError(f"Model {spec.model_id!r} is already registered")
+            self._specs[spec.model_id] = spec
+            if make_default or self._default_model_id is None:
+                self._default_model_id = spec.model_id
+
+    def get(self, model_id: str) -> ModelSpec:
+        with self._lock:
+            try:
+                return self._specs[model_id]
+            except KeyError as exc:
+                raise KeyError(f"Unknown model: {model_id!r}") from exc
+
+    def remove(self, model_id: str) -> ModelSpec:
+        with self._lock:
+            if model_id == self._default_model_id:
+                raise ValueError("Cannot remove the compatibility default model")
+            try:
+                return self._specs.pop(model_id)
+            except KeyError as exc:
+                raise KeyError(f"Unknown model: {model_id!r}") from exc
+
+    def values(self) -> tuple[ModelSpec, ...]:
+        with self._lock:
+            return tuple(self._specs.values())
+
+    def __contains__(self, model_id: str) -> bool:
+        with self._lock:
+            return model_id in self._specs
+
+
+def create_engine_model_registry(
+    vllm_config: Any, topology_planner: Any
+) -> ModelRegistry:
+    """Create the Engine registry and register its startup model uniformly."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    runtime = additional.setdefault("multi_model_runtime", {})
+    model_id = str(runtime.get("default_model_id", "reasoner"))
+    model_config = vllm_config.model_config
+    capabilities = ("text_generation",)
+    spec = ModelSpec(
+        model_id=model_id,
+        model_path=str(model_config.model),
+        backend="vllm",
+        capabilities=capabilities,
+        default_task=capabilities[0],
+    )
+    planned = topology_planner.plan(spec).apply(spec)
+    registry = ModelRegistry(default_model_id=model_id)
+    registry.register(planned, make_default=True)
+    # The same Engine-owned deployment description is serialized with the
+    # vLLM config and consumed by every Worker RunnerFactory.
+    runtime["startup_models"] = [planned.to_rpc_payload()]
+    return registry
+
+
+def restore_engine_model_registry(vllm_config: Any) -> ModelRegistry:
+    """Restore the EngineCore registry from Engine-planned startup specs."""
+    additional = getattr(vllm_config, "additional_config", None)
+    runtime = (
+        additional.get("multi_model_runtime", {})
+        if isinstance(additional, Mapping)
+        else {}
+    )
+    payloads = runtime.get("startup_models", ())
+    if not payloads:
+        raise RuntimeError("Engine config contains no planned startup models")
+    specs = tuple(ModelSpec.from_rpc_payload(payload) for payload in payloads)
+    default_model_id = str(
+        runtime.get("default_model_id", specs[0].model_id)
+    )
+    registry = ModelRegistry(default_model_id=default_model_id)
+    for spec in specs:
+        registry.register(
+            spec, make_default=spec.model_id == default_model_id
+        )
+    return registry

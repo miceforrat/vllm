@@ -459,6 +459,15 @@ class InprocClient(EngineCoreClient):
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
+    def call_utility(self, method: str, *args: Any) -> Any:
+        """Call an EngineCore utility in the in-process execution mode.
+
+        MPClient sends the same operation through its utility RPC channel.
+        InprocClient owns EngineCore directly, so preserve the common client
+        contract by dispatching the named method without a transport hop.
+        """
+        return getattr(self.engine_core, method)(*args)
+
     def dp_engines_running(self) -> bool:
         return False
 

@@ -44,7 +44,7 @@ def _run_reasoner(
     prompt_token_ids = tokenizer.encode(formatted_prompt)
     started = time.perf_counter()
     future = client.submit(
-        client.primary_model_id,
+        client.default_model_id,
         SchedulerModelRequest(
             prompt=[formatted_prompt],
             sampling_params=SamplingParams(
@@ -55,15 +55,19 @@ def _run_reasoner(
         ),
     )
     outputs = future.result()
-    torch.cuda.synchronize()
+    finished = time.perf_counter()
     candidate = outputs[0].outputs[0]
-    return {
-        "seconds": time.perf_counter() - started,
+    result = {
+        "seconds": finished - started,
         "prompt_tokens": len(prompt_token_ids),
         "completion_tokens": len(candidate.token_ids),
         "finish_reason": candidate.finish_reason,
         "text_sha256": hashlib.sha256(candidate.text.encode()).hexdigest(),
     }
+    timing = getattr(future, "timing", None)
+    if timing is not None:
+        result["scheduler_timing"] = timing
+    return result
 
 
 def _make_generator_request(args: argparse.Namespace, request_id: str) -> Any:
@@ -790,6 +794,7 @@ def main() -> None:
         gc.collect()
         report = {
             "gate": "worker_owned_primary_and_auxiliary_runners",
+            "execution_unit_scheduler": client.execution_unit_state(),
             "reasoner_execution": {
                 "mode": args.reasoner_mode,
                 **reasoner_execution,

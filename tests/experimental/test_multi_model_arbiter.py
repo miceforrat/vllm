@@ -49,6 +49,67 @@ def test_primary_demand_waits_for_full_generator_step() -> None:
     assert stats["primary_demand"] == 0
 
 
+def test_primary_admission_is_unique_full_to_shared_drain_owner() -> None:
+    class _BlockingEvent:
+        def __init__(self) -> None:
+            self.synchronize_started = threading.Event()
+            self.allow_completion = threading.Event()
+            self.synchronize_calls = 0
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+            self.synchronize_started.set()
+            assert self.allow_completion.wait(timeout=1.0)
+
+    arbiter = MultiModelResourceArbiter(
+        full_generator_stream="generator-full",
+        shared_generator_stream="generator-shared",
+    )
+    completion = _BlockingEvent()
+    full_lease = arbiter.acquire_generator_phase("denoising", 0)
+    assert full_lease is not None
+    full_lease.finish(completion)
+
+    primary_admitted = threading.Event()
+
+    def request_primary() -> None:
+        arbiter.acquire_primary_demand()
+        primary_admitted.set()
+
+    primary = threading.Thread(target=request_primary)
+    primary.start()
+    assert completion.synchronize_started.wait(timeout=1.0)
+
+    generator_admitted = threading.Event()
+    shared_leases = []
+
+    def start_shared_generator_phase() -> None:
+        shared_leases.append(
+            arbiter.acquire_generator_phase(
+                "denoising", 1, selected_mode="shared"
+            )
+        )
+        generator_admitted.set()
+
+    generator = threading.Thread(target=start_shared_generator_phase)
+    generator.start()
+    assert not primary_admitted.wait(timeout=0.01)
+    assert not generator_admitted.wait(timeout=0.01)
+
+    completion.allow_completion.set()
+    assert primary_admitted.wait(timeout=1.0)
+    assert generator_admitted.wait(timeout=1.0)
+    primary.join(timeout=1.0)
+    generator.join(timeout=1.0)
+
+    assert completion.synchronize_calls == 1
+    assert shared_leases[0] is not None
+    assert shared_leases[0].mode == "shared"
+    shared_leases[0].finish()
+    arbiter.acquire_generator_phase("complete")
+    arbiter.release_primary_demand()
+
+
 def test_generator_exposes_preparing_denoising_vae_and_complete() -> None:
     arbiter = MultiModelResourceArbiter(
         full_generator_stream="full",

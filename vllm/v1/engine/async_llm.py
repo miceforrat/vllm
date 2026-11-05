@@ -136,6 +136,13 @@ class AsyncLLM(EngineClient):
         self.multi_model_topology_planner = TopologyPlanner(
             vllm_config.parallel_config
         )
+        from vllm.experimental.model_instance_registry import (
+            create_engine_model_registry,
+        )
+
+        self.model_registry = create_engine_model_registry(
+            vllm_config, self.multi_model_topology_planner
+        )
         self._elastic_ep_lock = asyncio.Lock()
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -1173,6 +1180,14 @@ class AsyncLLM(EngineClient):
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs
         )
+
+    async def execution_unit_rpc(self, method: str, *args: Any) -> Any:
+        """Call an EngineCore execution-unit scheduling method."""
+        return await self.engine_core.call_utility_async(method, *args)
+
+    async def model_registry_rpc(self, method: str, *args: Any) -> Any:
+        """Call an EngineCore model-registry lifecycle method."""
+        return await self.engine_core.call_utility_async(method, *args)
 
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""

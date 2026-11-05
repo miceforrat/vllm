@@ -4,7 +4,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
@@ -313,6 +313,10 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # Scheduler-owned state for non-token execution units, such as one
+    # diffusion denoising step. Workers consume but never own this lifecycle.
+    execution_unit_state: dict[str, Any] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

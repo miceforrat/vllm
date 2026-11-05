@@ -9,6 +9,12 @@ from typing import Any
 
 import torch
 
+from vllm.experimental.communicator_registry import CommunicatorRegistry
+from vllm.experimental.model_instance_registry import (
+    ModelInstanceRegistry,
+    ModelSpec,
+)
+from vllm.experimental.runner_factory import RunnerFactory
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 from .reasoner_graph_variants import ModelGraphVariantManager
@@ -132,6 +138,14 @@ class MultiModelGPUWorker(GPUWorker):
     """Bind primary and auxiliary runners to complementary GC streams."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # These registries must exist before GPUWorker.__init__ reaches its
+        # overridable Runner construction hook. Startup and runtime-added
+        # models consequently use the same factory and ownership containers.
+        self._vllm_communicator_registry = CommunicatorRegistry()
+        self._vllm_model_instance_registry = ModelInstanceRegistry()
+        self._vllm_runner_factory = RunnerFactory(
+            self, self._vllm_communicator_registry
+        )
         super().__init__(*args, **kwargs)
         self._multi_model_gc_pair: Any | None = None
         # 记录当前选择了哪条
@@ -176,6 +190,26 @@ class MultiModelGPUWorker(GPUWorker):
         self._multi_model_startup_timeline: dict[str, float] = {}
         self._multi_model_primary_batch_index = 0
         self._multi_model_trace_partition_nvtx = False
+
+    def _create_model_runner(self):
+        """Materialize the Engine-planned startup model via RunnerFactory."""
+        additional = getattr(self.vllm_config, "additional_config", None)
+        runtime = (
+            additional.get("multi_model_runtime", {})
+            if isinstance(additional, dict)
+            else {}
+        )
+        startup = runtime.get("startup_models", ())
+        if len(startup) != 1:
+            raise RuntimeError(
+                "MultiModelGPUWorker requires exactly one Engine-planned "
+                f"startup model during the compatibility bootstrap, got "
+                f"{len(startup)}"
+            )
+        spec = ModelSpec.from_rpc_payload(startup[0])
+        instance = self._vllm_runner_factory.create(spec)
+        self._vllm_model_instance_registry.register(instance)
+        return instance.runner
 
     # 设备即初始化（主要多加入了gc）
     def init_device(self) -> None:
@@ -855,6 +889,15 @@ class MultiModelGPUWorker(GPUWorker):
         return full_device_after_cleanup
 
     def execute_model(self, scheduler_output: Any):
+        # This snapshot is authored by EngineCore's Scheduler and travels with
+        # the ordinary vLLM batch. Keep it at the Worker execution boundary so
+        # device-side arbitration can consume Engine policy without reaching
+        # back into Engine/Executor objects.
+        execution_unit_state = getattr(
+            scheduler_output, "execution_unit_state", None
+        )
+        if execution_unit_state is not None:
+            self._multi_model_execution_unit_state = execution_unit_state
         arbiter = self._multi_model_resource_arbiter
         stream = self._multi_model_reasoner_stream
         epoch_id = None
@@ -958,12 +1001,17 @@ class MultiModelGPUWorker(GPUWorker):
             return super().sample_tokens(grammar_output)
 
     def acquire_generator_phase_lease(
-        self, phase: str, step_index: int | None = None
+        self,
+        phase: str,
+        step_index: int | None = None,
+        selected_mode: str | None = None,
     ):
         arbiter = self._multi_model_resource_arbiter
         if arbiter is None:
             return None
-        return arbiter.acquire_generator_phase(phase, step_index)
+        return arbiter.acquire_generator_phase(
+            phase, step_index, selected_mode=selected_mode
+        )
 
     def acquire_generator_step_lease(self, step_index: int):
         return self.acquire_generator_phase_lease("denoising", step_index)
@@ -1012,6 +1060,9 @@ class MultiModelGPUWorker(GPUWorker):
             "actual_reasoner_sm_count": pair.second_sm_count,
             "total_sm_count": pair.total_sm_count,
             "partition_policy": self._multi_model_partition_policy,
+            "scheduler_execution_units": getattr(
+                self, "_multi_model_execution_unit_state", None
+            ),
             "generator_stream_handle": int(
                 self._multi_model_generator_stream.cuda_stream
             ),
@@ -1137,3 +1188,29 @@ class MultiModelGPUWorker(GPUWorker):
                 if pair is not None:
                     pair.close()
                     self._multi_model_gc_pair = None
+
+    def _shutdown_model_runner(self) -> None:
+        """Destroy all remaining model instances through RunnerFactory.
+
+        Runtime-added instances are normally removed by the frontend close
+        path first. The startup vLLM instance remains in the same registry and
+        reaches this hook at the native GPUWorker model-runner shutdown point.
+        Draining the whole registry also makes exceptional shutdown safe.
+        """
+        registry = self._vllm_model_instance_registry
+        instances = registry.drain()
+        errors: list[BaseException] = []
+        for instance in instances:
+            try:
+                self._vllm_runner_factory.destroy(instance)
+            except BaseException as exc:
+                errors.append(exc)
+        # A partially initialized Worker may not have registered its startup
+        # instance. Retain the native fallback for that exceptional case.
+        if getattr(self, "model_runner", None) is not None:
+            try:
+                super()._shutdown_model_runner()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]

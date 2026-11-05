@@ -74,7 +74,7 @@ async def run_reasoner(
     prompt_token_ids = tokenizer.encode(formatted_prompt)
     started = time.perf_counter()
     future = await client.submit(
-        client.primary_model_id,
+        client.default_model_id,
         SchedulerModelRequest(
             prompt=formatted_prompt,
             sampling_params=SamplingParams(

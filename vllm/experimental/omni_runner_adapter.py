@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import os
+import threading
 import types
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, fields
@@ -212,6 +213,15 @@ class EmbeddedOmniDiffusionRunner:
         self._step_mode_counts: dict[str, int] = {}
         self._phase_counts: dict[str, int] = {}
         self._active_phase_nvtx = False
+        self._active_execution_request_id: str | None = None
+        self._execution_unit_gate_enabled = False
+        self._execution_unit_condition = threading.Condition()
+        self._execution_unit_sequence = 0
+        self._pending_execution_unit: dict[str, Any] | None = None
+        self._execution_unit_decisions: dict[int, str] = {}
+        self._execution_unit_model_id: str | None = None
+        self._execution_unit_scheduler_address: str | None = None
+        self._execution_unit_scheduler_authkey: bytes | None = None
 
     @contextmanager
     def _memory_pool_context(self, tag: str) -> Any:
@@ -323,6 +333,12 @@ class EmbeddedOmniDiffusionRunner:
 
     def stream_control_stats(self) -> dict[str, Any]:
         return {
+            "runtime_providers": {
+                "memory": self.use_vllm_memory_pool,
+                "stream": True,
+                "communicator": self._auxiliary_tp_group is not None,
+                "phase": self._step_stream_selector is not None,
+            },
             "enabled": self.execution_stream is not None,
             "owner": (
                 "vllm" if self._owns_execution_stream else
@@ -359,13 +375,116 @@ class EmbeddedOmniDiffusionRunner:
         PREPARING, each DENOISING step, and the whole VAE decode as scheduling
         units while preserving Omni's caches, solver, and optimized kernels.
         """
-        if self.runner is None:
-            raise RuntimeError("Embedded Omni runner is not started")
         if self._step_stream_selector is not None:
             raise RuntimeError(
                 "A diffusion-step stream selector is already installed"
             )
-        pipeline = self.runner.pipeline
+        self._step_stream_selector = selector
+        if self.runner is None:
+            return
+        self.install(self.runner.pipeline)
+
+    def enable_engine_execution_unit_gate(self) -> None:
+        """Block each pipeline boundary until Engine policy admits it."""
+        self._execution_unit_gate_enabled = True
+
+    def configure_execution_unit_scheduler(
+        self,
+        *,
+        model_id: str,
+        address: str,
+        authkey_hex: str,
+    ) -> None:
+        self._execution_unit_model_id = model_id
+        self._execution_unit_scheduler_address = address
+        self._execution_unit_scheduler_authkey = bytes.fromhex(authkey_hex)
+        self.enable_engine_execution_unit_gate()
+
+    def _execution_unit_scheduler_call(
+        self, message: dict[str, Any]
+    ) -> dict[str, Any]:
+        from multiprocessing.connection import Client
+
+        address = self._execution_unit_scheduler_address
+        authkey = self._execution_unit_scheduler_authkey
+        if address is None or authkey is None:
+            raise RuntimeError("Engine execution-unit scheduler is not configured")
+        group = self._auxiliary_tp_group
+        rank_in_group = 0 if group is None else int(group.rank_in_group)
+        response = None
+        if rank_in_group == 0:
+            connection = Client(address, family="AF_UNIX", authkey=authkey)
+            try:
+                connection.send(message)
+                response = connection.recv()
+            finally:
+                connection.close()
+        if group is not None and int(group.world_size) > 1:
+            response = group.broadcast_object(response, src=0)
+        if not isinstance(response, dict) or not response.get("ok"):
+            raise RuntimeError(
+                "Engine execution-unit admission failed: "
+                f"{None if response is None else response.get('error')}"
+            )
+        return response["result"]
+
+    def pending_execution_unit(self) -> dict[str, Any] | None:
+        with self._execution_unit_condition:
+            pending = self._pending_execution_unit
+            return None if pending is None else dict(pending)
+
+    def admit_execution_unit(self, sequence: int, mode: str) -> None:
+        if mode not in {"shared", "generator_full"}:
+            raise ValueError(f"Unsupported Generator execution mode: {mode!r}")
+        with self._execution_unit_condition:
+            pending = self._pending_execution_unit
+            if pending is None or pending["sequence"] != sequence:
+                raise RuntimeError(
+                    f"Stale execution-unit admission: sequence={sequence}, "
+                    f"pending={pending!r}"
+                )
+            self._execution_unit_decisions[sequence] = mode
+            self._execution_unit_condition.notify_all()
+
+    def _await_execution_unit_admission(
+        self, phase: str, step_index: int | None
+    ) -> str | None:
+        if not self._execution_unit_gate_enabled:
+            return None
+        request_id = self._active_execution_request_id
+        if request_id is None:
+            raise RuntimeError("Engine-scheduled phase has no request identity")
+        if self._execution_unit_scheduler_address is not None:
+            admitted = self._execution_unit_scheduler_call(
+                {
+                    "operation": "boundary",
+                    "model_id": self._execution_unit_model_id,
+                    "request_id": request_id,
+                    "kind": phase,
+                    "index": step_index,
+                }
+            )
+            return admitted["active_unit"]["selected_mode"]
+        with self._execution_unit_condition:
+            sequence = self._execution_unit_sequence
+            self._execution_unit_sequence += 1
+            self._pending_execution_unit = {
+                "request_id": request_id,
+                "sequence": sequence,
+                "kind": phase,
+                "index": step_index,
+            }
+            self._execution_unit_condition.notify_all()
+            while sequence not in self._execution_unit_decisions:
+                self._execution_unit_condition.wait()
+            mode = self._execution_unit_decisions.pop(sequence)
+            self._pending_execution_unit = None
+            return mode
+
+    def install(self, pipeline: Any) -> None:
+        """Install phase boundaries through Omni's phase-provider contract."""
+        if self._step_hook_pipeline is not None:
+            raise RuntimeError("The diffusion phase provider is already installed")
         set_step = getattr(pipeline, "_set_denoise_step_metadata", None)
         clear_step = getattr(pipeline, "_clear_denoise_step_metadata", None)
         decode_latents = getattr(pipeline, "_decode_latents", None)
@@ -377,7 +496,6 @@ class EmbeddedOmniDiffusionRunner:
             raise RuntimeError(
                 "The Omni pipeline does not expose denoising and VAE boundaries"
             )
-        self._step_stream_selector = selector
         self._step_hook_pipeline = pipeline
         self._original_set_step_metadata = set_step
         self._original_clear_step_metadata = clear_step
@@ -436,6 +554,79 @@ class EmbeddedOmniDiffusionRunner:
             scheduled_decode_latents, pipeline
         )
 
+    def allocation_context(self, tag: str) -> Any:
+        """Omni memory-provider entry backed by vLLM's tagged allocator."""
+        return self._memory_pool_context(tag)
+
+    def communication_context(self) -> Any:
+        """Omni communicator-provider entry for this model instance."""
+        return self._execution_context()
+
+    @contextmanager
+    def execution_context(self) -> Any:
+        """Omni stream-provider entry preserving caller dependencies."""
+        stream = self.execution_stream
+        if self._step_stream_selector is not None:
+            torch.cuda.current_stream(self.device).synchronize()
+            yield
+            return
+        if stream is None:
+            current = torch.cuda.current_stream(self.device)
+            self._last_execution_stream_handle = self._stream_handle(current)
+            yield
+            return
+
+        caller = torch.cuda.current_stream(self.device)
+        stream.wait_stream(caller)
+        completion = None
+        try:
+            with torch.cuda.stream(stream):
+                actual = torch.cuda.current_stream(self.device)
+                self._last_execution_stream_handle = self._stream_handle(actual)
+                try:
+                    yield
+                finally:
+                    completion = torch.cuda.Event()
+                    completion.record(stream)
+        finally:
+            if completion is not None:
+                caller.wait_event(completion)
+
+    @contextmanager
+    def request_context(self, requests: Any | None = None) -> Any:
+        """Omni phase-provider entry for request begin/complete boundaries."""
+        request = requests
+        if isinstance(requests, (list, tuple)):
+            request = requests[0] if len(requests) == 1 else None
+        self._active_execution_request_id = (
+            None if request is None else getattr(request, "request_id", None)
+        )
+        self._begin_scheduled_phase("preparing")
+        try:
+            yield
+        finally:
+            try:
+                self._finish_generator_request()
+            finally:
+                self._active_execution_request_id = None
+
+    def runtime_providers(self) -> Any:
+        """Build the Omni aggregate provider without importing it at module load."""
+        from vllm_omni.diffusion.worker.runtime_providers import (
+            DiffusionRuntimeProviders,
+        )
+
+        return DiffusionRuntimeProviders(
+            memory=self if self.use_vllm_memory_pool else None,
+            stream=self,
+            communicator=self,
+            phase=self if self._step_stream_selector is not None else None,
+        )
+
+    def uninstall(self) -> None:
+        """Remove phase hooks installed through Omni's provider contract."""
+        self._restore_diffusion_step_stream_selector()
+
     def _before_vae_decoder_call(
         self, module: Any, args: tuple[Any, ...]
     ) -> None:
@@ -470,7 +661,13 @@ class EmbeddedOmniDiffusionRunner:
         if self._step_stream_selector is None:
             return
         self._finish_scheduled_phase()
-        lease = self._step_stream_selector(phase, step_index)
+        selected_mode = self._await_execution_unit_admission(phase, step_index)
+        if selected_mode is None:
+            lease = self._step_stream_selector(phase, step_index)
+        else:
+            lease = self._step_stream_selector(
+                phase, step_index, selected_mode
+            )
         self._phase_counts[phase] = self._phase_counts.get(phase, 0) + 1
         if lease is None:
             return
@@ -600,49 +797,11 @@ class EmbeddedOmniDiffusionRunner:
         )
 
     def execute_model(self, request: Any, **kwargs: Any) -> Any:
-        """Execute Omni on the installed stream while preserving dependencies."""
+        """Execute through Omni's model-scoped runtime providers."""
         if self.runner is None:
             raise RuntimeError("Embedded Omni runner is not started")
         request = self._restore_diffusion_request(request)
-        with self._execution_context():
-            stream = self.execution_stream
-            if self._step_stream_selector is not None:
-                # Dynamic scheduling is phase scoped.  Close work inherited
-                # from the caller before the first phase, then let every phase
-                # enter its own selected stream context.  Each phase boundary
-                # synchronizes before releasing its lease, so returning here
-                # does not require an event recorded on an outer GC stream.
-                caller = torch.cuda.current_stream(self.device)
-                caller.synchronize()
-                self._begin_scheduled_phase("preparing")
-                try:
-                    return self.runner.execute_model(request, **kwargs)
-                finally:
-                    self._finish_generator_request()
-
-            if stream is None:
-                current = torch.cuda.current_stream(self.device)
-                self._last_execution_stream_handle = self._stream_handle(current)
-                self._begin_scheduled_phase("preparing")
-                try:
-                    return self.runner.execute_model(request, **kwargs)
-                finally:
-                    self._finish_generator_request()
-
-            caller = torch.cuda.current_stream(self.device)
-            stream.wait_stream(caller)
-            with torch.cuda.stream(stream):
-                actual = torch.cuda.current_stream(self.device)
-                self._last_execution_stream_handle = self._stream_handle(actual)
-                self._begin_scheduled_phase("preparing")
-                try:
-                    output = self.runner.execute_model(request, **kwargs)
-                finally:
-                    self._finish_generator_request()
-                completion = torch.cuda.Event()
-                completion.record(stream)
-            caller.wait_event(completion)
-            return output
+        return self.runner.execute_model(request, **kwargs)
 
     def _finish_generator_request(self) -> None:
         """Close the active phase and publish an explicit COMPLETE boundary."""
@@ -652,6 +811,14 @@ class EmbeddedOmniDiffusionRunner:
             selector("complete", None)
             self._phase_counts["complete"] = (
                 self._phase_counts.get("complete", 0) + 1
+            )
+        request_id = self._active_execution_request_id
+        if (
+            request_id is not None
+            and self._execution_unit_scheduler_address is not None
+        ):
+            self._execution_unit_scheduler_call(
+                {"operation": "finish", "request_id": request_id}
             )
 
     def execute_model_profiled(
@@ -805,7 +972,6 @@ class EmbeddedOmniDiffusionRunner:
             od_config=od_config,
             device=self.device,
         )
-        memory_pool_context_fn = None
         if self.use_vllm_memory_pool:
             self.memory_allocator = get_mem_allocator_instance()
             if self.memory_allocator.get_current_usage() != 0:
@@ -814,9 +980,8 @@ class EmbeddedOmniDiffusionRunner:
                     "the initial adapter requires an empty allocator before "
                     "loading Diffusion weights"
                 )
-            memory_pool_context_fn = self._memory_pool_context
         self.runner.load_model(
-            memory_pool_context_fn=memory_pool_context_fn,
+            runtime_providers=self.runtime_providers(),
             load_format=load_format,
         )
         return self.runner
@@ -917,19 +1082,23 @@ class EmbeddedOmniDiffusionRunner:
             od_config=od_config,
             device=self.device,
         )
-        memory_pool_context_fn = None
         if self.use_vllm_memory_pool:
             self.memory_allocator = get_mem_allocator_instance()
-            memory_pool_context_fn = self._memory_pool_context
         with self._execution_context():
             self.runner.load_model(
-                memory_pool_context_fn=memory_pool_context_fn,
+                runtime_providers=self.runtime_providers(),
                 load_format=load_format,
             )
         return self.runner
 
     def close(self) -> None:
-        self._restore_diffusion_step_stream_selector()
+        runner = self.runner
+        if runner is not None:
+            release = getattr(runner, "release_runtime_providers", None)
+            if callable(release):
+                release()
+            else:
+                self._restore_diffusion_step_stream_selector()
         if self.execution_stream is not None:
             self.execution_stream.synchronize()
         self.runner = None

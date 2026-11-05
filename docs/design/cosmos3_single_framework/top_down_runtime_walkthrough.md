@@ -352,7 +352,19 @@ registered = await client.register(spec)
 
 `MultiModelWorkerExtension` 不是第二个 Worker，也不执行调度；它是注入现有 Worker 的 Runner/communicator registry 和 RPC surface。
 
-### 5.4 辅助 communicator
+### 5.4 RunnerFactory
+
+[`RunnerFactory`](../../../vllm/experimental/runner_factory.py) 是 Worker 内统一的 Runner 构造与销毁入口：
+
+- Engine 已经创建的 Reasoner 通过 `attach_existing()` 表示为普通 `ModelInstance`，不会重复加载；
+- 运行时追加的 Omni 模型通过 `OmniRunnerBackend.create()` 创建；
+- backend 负责 adapter、Runner 和 communicator 的成组创建、异常回滚与销毁；
+- `MultiModelWorkerExtension.register_model()` 只负责解析 `ModelSpec + TopologyPlan`、调用 Factory 并登记实例，不再包含 Omni 构造细节。
+
+Factory 只统一生命周期和 backend 路由；具体资源通过 Omni 的
+`DiffusionRuntimeProviders` 传入，不由 Factory 解释。
+
+### 5.5 辅助 communicator
 
 Worker 持有独立的 [`CommunicatorRegistry`](../../../vllm/experimental/communicator_registry.py)。它消费 Engine 下发的 `CommunicationGroupSpec`，使用 vLLM `init_model_parallel_group()` 物化本进程的 group handle，并按 `group_id + owner` 复用、引用计数和销毁。Runner 只拿到 group handle，不创建 topology，也不读取 Engine/Executor。
 
@@ -368,7 +380,22 @@ Worker 持有独立的 [`CommunicatorRegistry`](../../../vllm/experimental/commu
 
 [`ResolvedOmniDiffusionStage`](../../../vllm/experimental/omni_runner_adapter.py#L16) 保存 Omni 官方 config views。Adapter 继续调用 Omni resolver/enrich 逻辑，没有维护第二套 Cosmos3 配置解析器。
 
-### 6.2 Memory context
+### 6.2 Omni runtime providers
+
+Omni 分支新增 `DiffusionRuntimeProviders`，聚合四个均为可选的 model-scoped provider：
+
+- memory：`allocation_context(tag)`；
+- stream：`execution_context()`；
+- communicator：`communication_context()`；
+- phase：`install(pipeline) + request_context() + uninstall()`。
+
+`DiffusionModelRunner` 在未收到 providers 时保持原有行为。收到 providers
+时，加载阶段使用 memory provider；执行阶段按
+`communicator -> stream -> phase` 顺序进入上下文，并按相反顺序退出。
+这使资源所有权由 vLLM Worker 提供，但模型加载、cache、compile 和 forward
+仍由原版 Omni Runner 完成。
+
+### 6.3 Memory context
 
 [`_memory_pool_context()`](../../../vllm/experimental/omni_runner_adapter.py#L199) 将 Omni 暴露的持久分配点放入 vLLM allocator 的 tagged pool：
 
@@ -376,17 +403,17 @@ Worker 持有独立的 [`CommunicatorRegistry`](../../../vllm/experimental/commu
 - 后续 `reuse_memory_pool(tag)`；
 - tag 以 `model_id` 为前缀，避免多辅助模型冲突。
 
-[`start_on_worker()`](../../../vllm/experimental/omni_runner_adapter.py#L801) 把 context provider 传给 Omni `DiffusionModelRunner.load_model()`。当前已接入 Generator 权重、SeaCache 和 UND cache 的持久分配点，但这仍是共同 allocator/context，不是让 diffusion cache 与 Paged KV 共享同一个 block arena。
+[`start_on_worker()`](../../../vllm/experimental/omni_runner_adapter.py) 把聚合 provider 传给 Omni `DiffusionModelRunner.load_model()`。当前已接入 Generator 权重、SeaCache 和 UND cache 的持久分配点，但这仍是共同 allocator/context，不是让 diffusion cache 与 Paged KV 共享同一个 block arena。
 
-### 6.3 Omni group compatibility views
+### 6.4 Omni group compatibility views
 
 `start_on_worker()` 读取 vLLM world/TP/PP 和辅助 TP group，校验 Omni 其余并行维度，然后安装 Omni module-level compatibility views。执行期间 [`_runner_execution_context()`](../../../vllm/experimental/omni_runner_adapter.py#L217) 用 `use_tensor_model_parallel_group()` 选择当前 Runner 的 TP group。
 
 这保留了 Omni 内部现有 `get_tp_group()` 调用，但仍属于兼容层；长期更干净的方向是 model/runner-scoped communicator provider。
 
-### 6.4 Pipeline phase hook
+### 6.5 Pipeline phase hook
 
-[`set_generator_phase_stream_selector()`](../../../vllm/experimental/omni_runner_adapter.py#L335) 是动态调度的关键最小 patch。它没有重写 pipeline，而是包住已有边界：
+[`set_generator_phase_stream_selector()`](../../../vllm/experimental/omni_runner_adapter.py) 现在先配置 phase provider；Omni 在 pipeline 加载完成后通过正式 `install()` 接口安装边界。当前 Cosmos3 最小适配仍包住已有边界：
 
 - `_set_denoise_step_metadata`：每个 denoising step；
 - `_clear_denoise_step_metadata`：denoising 结束；
@@ -564,6 +591,7 @@ slot 只有在 D2H copy 完成并被 `get_output()` 消费后才归还。pool �
 | 同步/异步前端 client | [`WorkerHostedRunnerClient`](../../../vllm/experimental/multi_model_worker.py#L537)、[`AsyncWorkerHostedRunnerClient`](../../../vllm/experimental/multi_model_worker.py#L731) | 经 Engine collective RPC 控制 Worker-hosted Runner |
 | Engine topology planner | [`TopologyPlanner/TopologyPlan`](../../../vllm/experimental/multi_model_topology.py) | Engine 根据 parallel config 生成显式 placement 与通信域计划 |
 | Worker communicator registry | [`CommunicatorRegistry`](../../../vllm/experimental/communicator_registry.py) | Worker 消费计划并创建、复用、引用计数和销毁 communicator |
+| Runner factory | [`RunnerFactory`](../../../vllm/experimental/runner_factory.py) | 统一挂接 Engine-owned Runner，并按 backend 创建/销毁运行时追加 Runner |
 | 多模型 GPU Worker | [`MultiModelGPUWorker`](../../../vllm/experimental/multi_model_gpu_worker.py#L131) | 共同物理资源所有者和执行覆写入口 |
 | 互补 SM 分区 | [`GreenContextPair`](../../../vllm/experimental/green_context.py#L132) | 同一 GPU 上创建不重叠 GC streams |
 | 动态资源仲裁 | [`MultiModelResourceArbiter`](../../../vllm/experimental/multi_model_arbiter.py#L46) | 在 full/shared 三状态间按安全边界切换 |

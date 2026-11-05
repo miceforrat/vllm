@@ -503,7 +503,21 @@ class Worker(WorkerBase):
             _num_workspace_lanes(self.vllm_config, self.use_v2_model_runner),
         )
 
-        # Construct the model runner
+        # Construct the model runner through an overridable backend hook. The
+        # default implementation preserves native vLLM behavior; multi-model
+        # workers route this hook through their RunnerFactory.
+        self.model_runner = self._create_model_runner()
+
+        if self.rank == 0:
+            # If usage stat is enabled, collect relevant info.
+            report_usage_stats(self.vllm_config)
+
+    def _create_model_runner(self):
+        """Create this Worker's scheduler-managed Runner.
+
+        Kept as a hook so a multi-model Worker can use the same RunnerFactory
+        for startup and runtime-added model instances.
+        """
         if self.use_v2_model_runner:
             if self.vllm_config.is_mm_encoder_only:
                 from vllm.v1.worker.mm_encoder_model_runner import (
@@ -515,19 +529,13 @@ class Worker(WorkerBase):
                 )
 
             # HACK(woosuk): This is a temporary fix to avoid type errors.
-            self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore
-                self.vllm_config, self.device
-            )
+            return GPUModelRunnerV2(self.vllm_config, self.device)
         else:
             from vllm.v1.worker.gpu_model_runner import (
                 GPUModelRunner as GPUModelRunnerV1,
             )
 
-            self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
-
-        if self.rank == 0:
-            # If usage stat is enabled, collect relevant info.
-            report_usage_stats(self.vllm_config)
+            return GPUModelRunnerV1(self.vllm_config, self.device)
 
     def handle_ft_command(self, ft_request):
         assert self.worker_sentinel is not None
@@ -1588,10 +1596,11 @@ class Worker(WorkerBase):
 
         self.elastic_ep_executor.shutdown()
 
-        # Release GPU resources held by the model runner so that memory
-        # can be reclaimed when running in-process
-        if model_runner := getattr(self, "model_runner", None):
-            model_runner.shutdown()
+        # Release GPU resources held by model runners so that memory can be
+        # reclaimed when running in-process. Multi-model workers override
+        # this hook to route every instance through their RunnerFactory while
+        # preserving this point in the native shutdown order.
+        self._shutdown_model_runner()
 
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to
@@ -1601,6 +1610,13 @@ class Worker(WorkerBase):
 
             if CuMemAllocator.instance is not None:
                 CuMemAllocator.instance.release_pools()
+
+    def _shutdown_model_runner(self) -> None:
+        """Destroy the native Runner at its normal lifecycle boundary."""
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            model_runner.shutdown()
+            self.model_runner = None
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
