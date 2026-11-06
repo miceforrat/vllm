@@ -328,6 +328,19 @@ class AsyncLLM(EngineClient):
         if handler is not None:
             cancel_task_threadsafe(handler)
 
+    async def shutdown_async(self, timeout: float | None = None) -> None:
+        """Gracefully stop EngineCore before releasing frontend resources.
+
+        The explicit control-plane request avoids relying solely on Python
+        signal delivery in an EngineCore process that also hosts auxiliary
+        model runtimes. ``shutdown`` remains the synchronous fallback and owns
+        the actual process join and local resource cleanup.
+        """
+        engine_core = getattr(self, "engine_core", None)
+        if engine_core is not None:
+            await engine_core.call_utility_async("request_graceful_shutdown")
+        self.shutdown(timeout=timeout)
+
     def get_num_unfinished_requests(self) -> int:
         return self.output_processor.get_num_unfinished_requests()
 

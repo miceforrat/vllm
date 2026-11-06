@@ -39,11 +39,6 @@ class GeneratorPhaseLease:
         return self._arbiter.trace_partition_nvtx
 
 
-# Compatibility name for callers written before coarse Generator phases were
-# exposed. A denoising step is now one kind of Generator phase lease.
-GeneratorStepLease = GeneratorPhaseLease
-
-
 class MultiModelResourceArbiter:
     """Select full or partitioned Generator execution at safe boundaries.
 
@@ -350,13 +345,6 @@ class MultiModelResourceArbiter:
             return None
         return lease
 
-    def acquire_generator_step(self, step_index: int) -> GeneratorPhaseLease:
-        lease = self.acquire_generator_phase(
-            GeneratorExecutionPhase.DENOISING, step_index
-        )
-        assert lease is not None
-        return lease
-
     def finish_generator_phase(
         self, lease: GeneratorPhaseLease, completion_event: Any | None = None
     ) -> None:
@@ -372,9 +360,6 @@ class MultiModelResourceArbiter:
                     lease.mode,
                 )
             self._condition.notify_all()
-
-    def finish_generator_step(self, lease: GeneratorPhaseLease) -> None:
-        self.finish_generator_phase(lease)
 
     def stats(self) -> dict[str, Any]:
         with self._condition:

@@ -211,7 +211,7 @@ class MultiModelGPUWorker(GPUWorker):
         self._vllm_model_instance_registry.register(instance)
         return instance.runner
 
-    # 设备即初始化（主要多加入了gc）
+    # 设备级初始化（主要多加入了gc）
     def init_device(self) -> None:
         device_init_started = time.perf_counter()
         self._multi_model_startup_timeline[
@@ -1012,9 +1012,6 @@ class MultiModelGPUWorker(GPUWorker):
         return arbiter.acquire_generator_phase(
             phase, step_index, selected_mode=selected_mode
         )
-
-    def acquire_generator_step_lease(self, step_index: int):
-        return self.acquire_generator_phase_lease("denoising", step_index)
 
     def set_primary_model_demand(self, active: bool) -> dict[str, Any]:
         arbiter = self._multi_model_resource_arbiter

@@ -34,6 +34,8 @@ class SchedulerModelRequest:
     generate_kwargs: Mapping[str, Any] = field(default_factory=dict)
 
 
+# 负责注入每个 Worker，提供模型注册、异步执行、状态查询和关闭等 RPC
+# 目前的auxillary的命名是历史遗留产物，未来改过来
 class MultiModelWorkerExtension:
     """Own a unified registry of scheduler-managed and runtime-added models."""
 
@@ -112,14 +114,6 @@ class MultiModelWorkerExtension:
         instance = self._runner_factory().create(spec)
         registry.register(instance)
         return self._describe_model_instance(instance)
-
-    def register_auxiliary_runner(
-        self,
-        payload: Mapping[str, Any],
-        topology_payload: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        """Compatibility alias for clients created before ``register_model``."""
-        return self.register_model(payload, topology_payload)
 
     def execute_auxiliary_runner(
         self, model_id: str, request: Any, profile_memory: bool = False
@@ -355,13 +349,6 @@ class MultiModelWorkerExtension:
             factory = RunnerFactory(self, self._communicator_registry())
             self._vllm_runner_factory = factory
         return factory
-
-    def _auxiliary_runner_slots(self) -> dict[str, ModelInstance]:
-        """Compatibility view containing only runtime-added models."""
-        registry = getattr(self, "_vllm_model_instance_registry", None)
-        if registry is None:
-            return {}
-        return dict(registry.runtime_items())
 
     def _get_auxiliary_slot(self, model_id: str) -> ModelInstance:
         try:

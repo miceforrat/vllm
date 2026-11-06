@@ -103,7 +103,7 @@ class ModelGraphVariantManager:
         self.active_name = name
         return variant
 
-    def get(self, name: str) -> ReasonerGraphVariant | None:
+    def get(self, name: str) -> ModelGraphVariant | None:
         return self._variants.get(name)
 
     def counts(self) -> dict[str, int]:
@@ -116,9 +116,3 @@ class ModelGraphVariantManager:
         self._variants.clear()
         self.active_name = None
         self._capture_handler = None
-
-
-# Compatibility names for reports/tests written before the manager became a
-# model-level multi-variant interface.
-ReasonerGraphVariant = ModelGraphVariant
-ReasonerGraphVariantRegistry = ModelGraphVariantManager

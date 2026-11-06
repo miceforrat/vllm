@@ -15,7 +15,8 @@ def test_primary_demand_waits_for_full_generator_step() -> None:
         full_generator_stream=full_stream,
         shared_generator_stream=shared_stream,
     )
-    full_lease = arbiter.acquire_generator_step(0)
+    full_lease = arbiter.acquire_generator_phase("denoising", 0)
+    assert full_lease is not None
     assert full_lease.mode == "generator_full"
     assert full_lease.stream is full_stream
 
@@ -33,13 +34,15 @@ def test_primary_demand_waits_for_full_generator_step() -> None:
     assert admitted.wait(timeout=1.0)
     waiter.join(timeout=1.0)
 
-    shared_lease = arbiter.acquire_generator_step(1)
+    shared_lease = arbiter.acquire_generator_phase("denoising", 1)
+    assert shared_lease is not None
     assert shared_lease.mode == "shared"
     assert shared_lease.stream is shared_stream
     shared_lease.finish()
 
     arbiter.release_primary_demand()
-    next_full_lease = arbiter.acquire_generator_step(2)
+    next_full_lease = arbiter.acquire_generator_phase("denoising", 2)
+    assert next_full_lease is not None
     assert next_full_lease.mode == "generator_full"
     next_full_lease.finish()
 

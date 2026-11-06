@@ -17,6 +17,7 @@ class CommunicationGroupSpec:
     parallel_dimension: str
     ranks: tuple[int, ...]
     backend: str | None = None
+    # 是否创建gpu侧的communicator
     use_device_communicator: bool = True
 
     @classmethod
@@ -30,6 +31,7 @@ class CommunicationGroupSpec:
         return cls(**values)
 
 
+# ModelSpec是跨越多个rank的
 @dataclass(frozen=True)
 class ModelSpec:
     """Serializable description of one model instance.
@@ -42,11 +44,16 @@ class ModelSpec:
     model_id: str
     model_path: str
     backend: str
+    # 该模型能处理的请求类型集合
     capabilities: tuple[str, ...] = ()
     default_task: str | None = None
+
+    # 该模型放在哪些rank上
     worker_ranks: tuple[int, ...] = ()
+    # 该模型使用的通信组
     communication_groups: tuple[CommunicationGroupSpec, ...] = ()
     load_format: str = "default"
+    # 仅对特定后端生效的配置项
     backend_options: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -79,22 +86,29 @@ class ModelSpec:
         )
 
 
+# 本地的model 实例
 @dataclass
 class ModelInstance:
     """One Worker-local materialization of a :class:`ModelSpec`."""
 
     spec: ModelSpec
     runner: Any
+    # adapter：可选的 backend 适配器。当前 Omni 使用 EmbeddedOmniDiffusionRunner 管理 provider、phase hook 和生命周期；原生 vLLM 当前没有显式adapter。
     adapter: Any | None = None
+    # 是否由 vLLM 原生 Scheduler 驱动执行
     scheduler_managed: bool = False
+    # 是否在 Engine 启动完成后动态注册；这个变量可以考虑去掉了
     runtime_added: bool = False
     communication_group_ids: tuple[str, ...] = ()
+    # 这几个变量和测试有关，主要是同步启动genertor和LLM的需求
     pending_future: Future[Any] | None = None
     pending_start: threading.Event | None = None
     pending_started: threading.Event | None = None
     pending_job_id: str | None = None
 
 
+# 这个类负责注册模型实例（本地rank）
+# 由每个 MultiModelGPUWorker、RunnerFactory 和 MultiModelWorkerExtension 使用，负责查找、执行和销毁本 Worker 上的 Runner
 class ModelInstanceRegistry:
     """Own every model instance materialized by one vLLM Worker."""
 
@@ -163,6 +177,8 @@ class ModelInstanceRegistry:
             return model_id in self._instances
 
 
+# 这个类负责管理模型的整体spec
+# 由 LLMEngine/AsyncLLM、EngineCore 和 WorkerHostedRunnerClient 使用，负责模型注册、查询和请求路由。
 class ModelRegistry:
     """Engine-owned registry of every deployed model specification.
 
@@ -218,6 +234,8 @@ class ModelRegistry:
             return model_id in self._specs
 
 
+# 在 Engine frontend 中，把原生 vllm_config.model_config 转成 startup ModelSpec，规划拓扑、注册到 frontend registry，并序列化到 startup_models 供其他进程使用
+# 未来还是把这功能也挪到engine core里面比较合适
 def create_engine_model_registry(
     vllm_config: Any, topology_planner: Any
 ) -> ModelRegistry:

@@ -13,9 +13,11 @@ from vllm.experimental.model_instance_registry import (
 )
 
 
+# 统一的Runner后端协议
 class RunnerBackend(Protocol):
     """Backend-specific construction and teardown of one model instance."""
 
+    # 这里传递worker不太好，未来等稳定了再考虑是不是单独创一个参数类
     def create(
         self,
         spec: ModelSpec,
@@ -32,6 +34,7 @@ class RunnerBackend(Protocol):
     ) -> None: ...
 
 
+# vLLM的后端
 class VllmRunnerBackend:
     """Construct the native vLLM Runner through the common factory path."""
 
@@ -77,9 +80,12 @@ class VllmRunnerBackend:
         instance.runner = None
 
 
+# vllm-omni的后端
 class OmniRunnerBackend:
     """Construct the existing Omni DiffusionModelRunner inside a vLLM Worker."""
 
+    # 从spec里获取并行组配置
+    # 这里因为我们只搞了同构TP，所以还验证了是否同构
     @staticmethod
     def _tp_group_spec(spec: ModelSpec) -> CommunicationGroupSpec:
         from vllm.distributed.parallel_state import get_tp_group
@@ -148,6 +154,7 @@ class OmniRunnerBackend:
             )
             if execution_stream is not None:
                 adapter.set_execution_stream(execution_stream)
+            # 和执行流资源选择相关
             phase_selector = (
                 getattr(worker, "acquire_generator_phase_lease", None)
                 if getattr(worker, "_multi_model_resource_arbiter", None)

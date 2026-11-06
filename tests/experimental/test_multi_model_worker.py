@@ -191,7 +191,7 @@ def test_worker_skips_model_not_placed_on_its_rank() -> None:
     worker = MultiModelWorkerExtension()
     worker.rank = 2
 
-    result = worker.register_auxiliary_runner(
+    result = worker.register_model(
         ModelSpec(
             model_id="generator-a",
             model_path="nvidia/Cosmos3-Edge",
@@ -208,7 +208,7 @@ def test_worker_skips_model_not_placed_on_its_rank() -> None:
     )
 
     assert result == {"model_id": "generator-a", "active": False, "rank": 2}
-    assert worker._auxiliary_runner_slots() == {}
+    assert worker._model_instance_registry().runtime_items() == ()
 
 def test_client_requests_worker_topology() -> None:
     topology = [{"rank": 0}, {"rank": 1}]

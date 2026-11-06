@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import threading
-
 from vllm.experimental.omni_runner_adapter import EmbeddedOmniDiffusionRunner
 
 
@@ -46,34 +44,26 @@ def test_runtime_provider_bundle_is_model_scoped() -> None:
     assert providers.phase is runner
 
 
-def test_execution_unit_gate_blocks_until_engine_admission() -> None:
+def test_execution_unit_boundary_uses_engine_scheduler() -> None:
     runner = EmbeddedOmniDiffusionRunner(object(), device="cpu")
     runner._active_execution_request_id = "request-1"
-    runner.enable_engine_execution_unit_gate()
-    selected: list[str | None] = []
+    runner._execution_unit_model_id = "generator-a"
+    runner._execution_unit_scheduler_address = "/tmp/scheduler.sock"
+    messages: list[dict[str, object]] = []
 
-    thread = threading.Thread(
-        target=lambda: selected.append(
-            runner._await_execution_unit_admission("denoising", 3)
-        )
-    )
-    thread.start()
-    with runner._execution_unit_condition:
-        runner._execution_unit_condition.wait_for(
-            lambda: runner._pending_execution_unit is not None,
-            timeout=1.0,
-        )
-        pending = dict(runner._pending_execution_unit or {})
+    def call(message: dict[str, object]) -> dict[str, object]:
+        messages.append(message)
+        return {"active_unit": {"selected_mode": "shared"}}
 
-    assert thread.is_alive()
-    assert pending == {
-        "request_id": "request-1",
-        "sequence": 0,
-        "kind": "denoising",
-        "index": 3,
-    }
-    runner.admit_execution_unit(0, "shared")
-    thread.join(timeout=1.0)
+    runner._execution_unit_scheduler_call = call  # type: ignore[method-assign]
 
-    assert selected == ["shared"]
-    assert runner.pending_execution_unit() is None
+    assert runner._await_execution_unit_admission("denoising", 3) == "shared"
+    assert messages == [
+        {
+            "operation": "boundary",
+            "model_id": "generator-a",
+            "request_id": "request-1",
+            "kind": "denoising",
+            "index": 3,
+        }
+    ]

@@ -422,17 +422,24 @@ Worker
 
 ## 15. 推荐阅读顺序
 
-按下面顺序读，最容易建立完整调用链：
+dead path 清理后，按下面顺序读即可覆盖当前活跃调用链：
 
-1. [`omni_worker_owned_gate.py::main()`](../../../examples/offline_inference/omni_worker_owned_gate.py#L337)
-2. [`ModelSpec` / `ModelRegistry` / `ModelInstanceRegistry`](../../../vllm/experimental/model_instance_registry.py)
-3. [`RunnerFactory`](../../../vllm/experimental/runner_factory.py)
-4. [`MultiModelGPUWorker._create_model_runner()`](../../../vllm/experimental/multi_model_gpu_worker.py#L194)
-5. [`WorkerHostedRunnerClient.register/submit`](../../../vllm/experimental/multi_model_worker.py#L414)
-6. [`TopologyPlanner`](../../../vllm/experimental/multi_model_topology.py#L54) 与 [`CommunicatorRegistry`](../../../vllm/experimental/communicator_registry.py#L19)
-7. [`ExecutionUnitScheduler`](../../../vllm/v1/core/sched/execution_units.py#L73)
-8. [`EmbeddedOmniDiffusionRunner`](../../../vllm/experimental/omni_runner_adapter.py#L148)
-9. [`MultiModelResourceArbiter`](../../../vllm/experimental/multi_model_arbiter.py#L47)
-10. [`ModelGraphVariantManager`](../../../vllm/experimental/reasoner_graph_variants.py#L25)
+下面第 1–10 项均以 `vllm-single-framework/` 仓库根目录为基准：
 
-读完这十处，再回到 gate 的 reporting 部分，就能区分哪些字段是实际控制状态、哪些只是实验观测量。
+1. [`examples/offline_inference/omni_worker_owned_gate.py::main()`](../../../examples/offline_inference/omni_worker_owned_gate.py#L337)
+2. [`vllm/experimental/model_instance_registry.py`](../../../vllm/experimental/model_instance_registry.py)：`ModelSpec`、`ModelRegistry`、`ModelInstanceRegistry`，重点看 `create_engine_model_registry()` 与 `restore_engine_model_registry()`
+3. [`vllm/experimental/runner_factory.py`](../../../vllm/experimental/runner_factory.py#L194)：`RunnerFactory.create/destroy`
+4. [`vllm/experimental/multi_model_gpu_worker.py`](../../../vllm/experimental/multi_model_gpu_worker.py#L194)：`MultiModelGPUWorker._create_model_runner()` 与 `_shutdown_model_runner()`
+5. [`vllm/experimental/multi_model_worker.py`](../../../vllm/experimental/multi_model_worker.py#L399)：`WorkerHostedRunnerClient.register/submit`
+6. [`vllm/experimental/multi_model_topology.py`](../../../vllm/experimental/multi_model_topology.py#L54) 与 [`vllm/experimental/communicator_registry.py`](../../../vllm/experimental/communicator_registry.py#L19)：`TopologyPlanner` 与 `CommunicatorRegistry`
+7. [`vllm/v1/core/sched/execution_units.py`](../../../vllm/v1/core/sched/execution_units.py#L73)：`ExecutionUnitScheduler`
+8. [`vllm/experimental/omni_runner_adapter.py`](../../../vllm/experimental/omni_runner_adapter.py#L147)：`EmbeddedOmniDiffusionRunner`，重点看 `configure_execution_unit_scheduler()` 与 `_await_execution_unit_admission()`；旧的本地 Condition admission gate 已删除
+9. [`vllm/experimental/multi_model_arbiter.py`](../../../vllm/experimental/multi_model_arbiter.py#L42)：`MultiModelResourceArbiter`，从 `acquire_generator_phase()`/`finish_generator_phase()` 阅读，不再经过旧 step-only alias
+10. [`vllm/experimental/reasoner_graph_variants.py`](../../../vllm/experimental/reasoner_graph_variants.py#L25)：`ModelGraphVariantManager`
+
+Omni 侧的修改以 vLLM-Omni 仓库根目录为基准，继续阅读：
+
+11. `vllm_omni/diffusion/worker/runtime_providers.py`：定义 model-scoped memory/stream/phase/communicator provider 契约
+12. `vllm_omni/diffusion/worker/diffusion_model_runner.py`：消费 runtime providers，并在模型加载、请求执行和关闭阶段进入相应 context
+
+读完这些位置，再回到 gate 的 reporting 部分，就能区分实际控制状态与实验观测量。旧 `auxiliary` 命名仍存在于当前活跃 Worker RPC 中，不能仅凭名称视为 dead path；已经删除的是不再被当前调用链使用的兼容 alias 和本地 admission fallback。

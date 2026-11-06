@@ -814,7 +814,9 @@ async def async_main(args: argparse.Namespace) -> None:
     finally:
         # 关闭资源
         await client.close()
-        engine.shutdown(timeout=float(args.engine_shutdown_timeout_seconds))
+        await engine.shutdown_async(
+            timeout=float(args.engine_shutdown_timeout_seconds)
+        )
 
 
 def main() -> None:

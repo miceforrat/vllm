@@ -845,6 +845,17 @@ class EngineCore:
         cleanup_dist_env_and_memory()
         logger.debug_once("[shutdown] EngineCore: local resource teardown complete")
 
+    def request_graceful_shutdown(self) -> None:
+        """Request shutdown through the normal EngineCore control plane.
+
+        Multiprocess clients normally initiate shutdown with SIGTERM.  A core
+        hosting long-lived model runtimes can spend enough time in native code
+        that Python does not dispatch its signal handler promptly.  A utility
+        request is handled by the core loop itself, so the reply is published
+        before the next loop iteration observes the requested shutdown state.
+        """
+        self.shutdown_state = EngineShutdownState.REQUESTED
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)
 

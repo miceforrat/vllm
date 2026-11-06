@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import gc
 import os
-import threading
 import types
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, fields
@@ -214,11 +213,6 @@ class EmbeddedOmniDiffusionRunner:
         self._phase_counts: dict[str, int] = {}
         self._active_phase_nvtx = False
         self._active_execution_request_id: str | None = None
-        self._execution_unit_gate_enabled = False
-        self._execution_unit_condition = threading.Condition()
-        self._execution_unit_sequence = 0
-        self._pending_execution_unit: dict[str, Any] | None = None
-        self._execution_unit_decisions: dict[int, str] = {}
         self._execution_unit_model_id: str | None = None
         self._execution_unit_scheduler_address: str | None = None
         self._execution_unit_scheduler_authkey: bytes | None = None
@@ -384,10 +378,6 @@ class EmbeddedOmniDiffusionRunner:
             return
         self.install(self.runner.pipeline)
 
-    def enable_engine_execution_unit_gate(self) -> None:
-        """Block each pipeline boundary until Engine policy admits it."""
-        self._execution_unit_gate_enabled = True
-
     def configure_execution_unit_scheduler(
         self,
         *,
@@ -398,7 +388,6 @@ class EmbeddedOmniDiffusionRunner:
         self._execution_unit_model_id = model_id
         self._execution_unit_scheduler_address = address
         self._execution_unit_scheduler_authkey = bytes.fromhex(authkey_hex)
-        self.enable_engine_execution_unit_gate()
 
     def _execution_unit_scheduler_call(
         self, message: dict[str, Any]
@@ -428,58 +417,24 @@ class EmbeddedOmniDiffusionRunner:
             )
         return response["result"]
 
-    def pending_execution_unit(self) -> dict[str, Any] | None:
-        with self._execution_unit_condition:
-            pending = self._pending_execution_unit
-            return None if pending is None else dict(pending)
-
-    def admit_execution_unit(self, sequence: int, mode: str) -> None:
-        if mode not in {"shared", "generator_full"}:
-            raise ValueError(f"Unsupported Generator execution mode: {mode!r}")
-        with self._execution_unit_condition:
-            pending = self._pending_execution_unit
-            if pending is None or pending["sequence"] != sequence:
-                raise RuntimeError(
-                    f"Stale execution-unit admission: sequence={sequence}, "
-                    f"pending={pending!r}"
-                )
-            self._execution_unit_decisions[sequence] = mode
-            self._execution_unit_condition.notify_all()
-
     def _await_execution_unit_admission(
         self, phase: str, step_index: int | None
     ) -> str | None:
-        if not self._execution_unit_gate_enabled:
+        if self._execution_unit_scheduler_address is None:
             return None
         request_id = self._active_execution_request_id
         if request_id is None:
             raise RuntimeError("Engine-scheduled phase has no request identity")
-        if self._execution_unit_scheduler_address is not None:
-            admitted = self._execution_unit_scheduler_call(
-                {
-                    "operation": "boundary",
-                    "model_id": self._execution_unit_model_id,
-                    "request_id": request_id,
-                    "kind": phase,
-                    "index": step_index,
-                }
-            )
-            return admitted["active_unit"]["selected_mode"]
-        with self._execution_unit_condition:
-            sequence = self._execution_unit_sequence
-            self._execution_unit_sequence += 1
-            self._pending_execution_unit = {
+        admitted = self._execution_unit_scheduler_call(
+            {
+                "operation": "boundary",
+                "model_id": self._execution_unit_model_id,
                 "request_id": request_id,
-                "sequence": sequence,
                 "kind": phase,
                 "index": step_index,
             }
-            self._execution_unit_condition.notify_all()
-            while sequence not in self._execution_unit_decisions:
-                self._execution_unit_condition.wait()
-            mode = self._execution_unit_decisions.pop(sequence)
-            self._pending_execution_unit = None
-            return mode
+        )
+        return admitted["active_unit"]["selected_mode"]
 
     def install(self, pipeline: Any) -> None:
         """Install phase boundaries through Omni's phase-provider contract."""
@@ -644,17 +599,6 @@ class EmbeddedOmniDiffusionRunner:
             self._begin_scheduled_phase("vae", self._vae_segment_index)
         self._vae_decoder_calls += 1
 
-    def set_diffusion_step_stream_selector(self, selector: Any) -> None:
-        """Compatibility adapter for the original step-only selector."""
-
-        def phase_selector(phase: str, step_index: int | None = None) -> Any:
-            if phase != "denoising":
-                return None
-            assert step_index is not None
-            return selector(step_index)
-
-        self.set_generator_phase_stream_selector(phase_selector)
-
     def _begin_scheduled_phase(
         self, phase: str, step_index: int | None = None
     ) -> None:
@@ -741,9 +685,6 @@ class EmbeddedOmniDiffusionRunner:
                     lease.finish(completion_event)
                     self._active_step_lease = None
                     self._step_stream = None
-
-    def _finish_scheduled_step(self) -> None:
-        self._finish_scheduled_phase()
 
     def _restore_diffusion_step_stream_selector(self) -> None:
         self._finish_scheduled_phase()

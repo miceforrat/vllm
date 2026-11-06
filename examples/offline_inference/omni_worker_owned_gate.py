@@ -43,6 +43,8 @@ def _run_reasoner(
     )
     prompt_token_ids = tokenizer.encode(formatted_prompt)
     started = time.perf_counter()
+
+    # 已经采用了统一的提交任务的方法
     future = client.submit(
         client.default_model_id,
         SchedulerModelRequest(
@@ -130,6 +132,7 @@ def _describe_memory_profile(profile: Any) -> dict[str, Any]:
     )
 
 
+# 在这里并发运行
 def _run_concurrent_once_impl(
     *,
     reasoner: Any,
@@ -144,6 +147,7 @@ def _run_concurrent_once_impl(
     )
     generator_future = None
     if args.concurrent_start_mode == "reasoner_coupled":
+        # 早期为了确保同时启动使用的，现在不用了
         client.prepare(
             model_id,
             generator_request,
@@ -335,6 +339,7 @@ def _verify_resource_contract(
 
 
 def main() -> None:
+    # 参数解析
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="nvidia/Cosmos3-Edge")
     parser.add_argument("--tp-size", type=int, default=1)
@@ -491,6 +496,8 @@ def main() -> None:
         args.worker_shutdown_timeout_seconds
     )
 
+    # reasoner输入
+    # 仅作为demo测试
     reasoner_prompt = (
         "Describe a safe plan for a robot to move a cup onto a shelf."
     )
@@ -504,6 +511,7 @@ def main() -> None:
             reasoner_input.get("max_new_tokens", args.reasoner_max_tokens)
         )
 
+    # 预先构造好的generator输入
     generator_manifest = None
     if args.generator_workload_manifest is not None:
         generator_manifest = json.loads(
@@ -522,6 +530,7 @@ def main() -> None:
 
     from vllm import LLM
 
+    # 其他配置构造
     reasoner_execution: dict[str, Any]
     if args.reasoner_mode == "eager":
         reasoner_execution = {"enforce_eager": True}
@@ -564,6 +573,9 @@ def main() -> None:
             },
         }
 
+    # 目前还没有起一套新的engine
+    # 未来考虑加入一个multi-model感知的engine
+    # 所以能看到参数里还有 worker_extension_cls这种东西
     reasoner = LLM(
         model=args.model,
         tensor_parallel_size=args.tp_size,
@@ -613,6 +625,8 @@ def main() -> None:
                 kind=args.generator_stream,
                 sm_count=None,
             )
+
+        # warmup
         reasoner_result = _run_reasoner(
             client,
             reasoner,
@@ -680,6 +694,7 @@ def main() -> None:
                 )
             )
 
+        # 剩下的部分都是统计信息了
         concurrency_summary = None
         if alone_rows and concurrent_rows:
             reasoner_alone_seconds = statistics.median(
@@ -873,6 +888,7 @@ def main() -> None:
         args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(json.dumps(report, indent=2), flush=True)
     finally:
+        # 资源释放
         client.close()
         reasoner.llm_engine.engine_core.shutdown(
             timeout=float(args.engine_shutdown_timeout_seconds)
