@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Hashable
 
 import torch
 
@@ -156,6 +156,8 @@ class ForwardContext:
     # by default NONE, no cudagraph is used.
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE
     batch_descriptor: BatchDescriptor | None = None
+    # 同一模型可在不同 stream/Green Context 上捕获等价执行变体。
+    cudagraph_resource_variant: Hashable = "default"
 
     ubatch_slices: UBatchSlices | None = None
 
@@ -238,6 +240,7 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    cudagraph_resource_variant: Hashable = "default",
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -256,6 +259,7 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
+        cudagraph_resource_variant=cudagraph_resource_variant,
     )
 
 
@@ -286,6 +290,7 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    cudagraph_resource_variant: Hashable = "default",
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -355,6 +360,7 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
+        cudagraph_resource_variant=cudagraph_resource_variant,
     )
 
     try:

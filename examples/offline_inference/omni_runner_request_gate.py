@@ -14,7 +14,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from vllm.experimental.omni_runner_adapter import (
+from vllm.experimental.archived.omni_runner_adapter import (
     EmbeddedOmniDiffusionRunner,
     resolve_omni_diffusion_stage,
 )

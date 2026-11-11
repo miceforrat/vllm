@@ -14,7 +14,7 @@ from vllm.experimental.model_instance_registry import (
 
 @dataclass(frozen=True)
 class TopologyPlan:
-    """Serializable placement and communication plan for one model instance."""
+    """对拓扑规划的描述，从模型视角转到部署视角"""
 
     model_id: str
     worker_ranks: tuple[int, ...]

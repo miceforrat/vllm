@@ -3,15 +3,17 @@
 import asyncio
 from typing import Any
 
-import vllm.experimental.multi_model_worker as multi_model_worker
-from vllm.experimental.communicator_registry import CommunicatorRegistry
+import vllm.experimental.archived.multi_model_worker as multi_model_worker
+from vllm.experimental.archived.communicator_registry import CommunicatorRegistry
 from vllm.experimental.model_instance_registry import (
-    ModelInstance,
-    ModelInstanceRegistry,
     ModelRegistry,
 )
+from vllm.experimental.archived.model_instance_registry import (
+    ModelInstance,
+    ModelInstanceRegistry,
+)
 from vllm.experimental.multi_model_topology import TopologyPlan, TopologyPlanner
-from vllm.experimental.multi_model_worker import (
+from vllm.experimental.archived.multi_model_worker import (
     AsyncWorkerHostedRunnerClient,
     CommunicationGroupSpec,
     ModelSpec,

@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from vllm.experimental.omni_runner_adapter import (
+from vllm.experimental.archived.omni_runner_adapter import (
     EmbeddedOmniDiffusionRunner,
     resolve_omni_diffusion_stage,
 )

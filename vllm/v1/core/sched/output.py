@@ -314,9 +314,13 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
-    # Scheduler-owned state for non-token execution units, such as one
+    # Scheduler-owned state for non-token execution slices, such as one
     # diffusion denoising step. Workers consume but never own this lifecycle.
     execution_unit_state: dict[str, Any] | None = None
+
+    # EngineCore 为本次 batch 选定的逻辑资源变体和执行 epoch。
+    # Worker 只按该决策激活本地 stream/graph/memory 组合。
+    scheduled_execution_slice: dict[str, Any] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

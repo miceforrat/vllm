@@ -62,18 +62,6 @@ class LLMEngine:
     ) -> None:
         configure_logging_if_needed(vllm_config.logging_config)
         self.vllm_config = vllm_config
-        from vllm.experimental.multi_model_topology import TopologyPlanner
-
-        self.multi_model_topology_planner = TopologyPlanner(
-            vllm_config.parallel_config
-        )
-        from vllm.experimental.model_instance_registry import (
-            create_engine_model_registry,
-        )
-
-        self.model_registry = create_engine_model_registry(
-            vllm_config, self.multi_model_topology_planner
-        )
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
 
@@ -295,7 +283,7 @@ class LLMEngine:
             # Make a new RequestState and queue.
             self.output_processor.add_request(request, prompt_text, None, 0)
             # Add the request to EngineCore.
-            self.engine_core.add_request(request)
+            self._dispatch_prepared_request(request)
             return req_id
 
         # Fan out child requests (for n>1).
@@ -311,9 +299,17 @@ class LLMEngine:
                 child_request, prompt_text, parent_req, idx
             )
             # Add the request to EngineCore.
-            self.engine_core.add_request(child_request)
+            self._dispatch_prepared_request(child_request)
 
         return req_id
+
+    def _dispatch_prepared_request(self, request: EngineCoreRequest) -> None:
+        """把 Frontend 已预处理的请求交给 EngineCore。"""
+        dispatcher = getattr(self, "prepared_request_dispatcher", None)
+        if dispatcher is None:
+            self.engine_core.add_request(request)
+        else:
+            dispatcher(request)
 
     def step(self) -> list[RequestOutput | PoolingRequestOutput]:
         if self.should_execute_dummy_batch:

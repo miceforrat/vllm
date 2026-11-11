@@ -25,7 +25,7 @@ from omni_runner_gc_concurrent_gate import (
     build_generator_request,
     find_tensor,
 )
-from vllm.experimental.omni_runner_adapter import (
+from vllm.experimental.archived.omni_runner_adapter import (
     EmbeddedOmniDiffusionRunner,
     resolve_omni_diffusion_stage,
 )

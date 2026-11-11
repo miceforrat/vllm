@@ -2,9 +2,10 @@
 
 from typing import Any
 
-from vllm.experimental.communicator_registry import CommunicatorRegistry
-from vllm.experimental.model_instance_registry import ModelInstance, ModelSpec
-from vllm.experimental.runner_factory import RunnerFactory
+from vllm.experimental.archived.communicator_registry import CommunicatorRegistry
+from vllm.experimental.model_instance_registry import ModelSpec
+from vllm.experimental.archived.model_instance_registry import ModelInstance
+from vllm.experimental.archived.runner_factory import RunnerFactory
 
 
 class _Backend:

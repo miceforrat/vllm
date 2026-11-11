@@ -3,7 +3,9 @@
 from types import SimpleNamespace
 from typing import Any
 
-from vllm.experimental.reasoner_graph_variants import ModelGraphVariantManager
+from vllm.experimental.archived.reasoner_graph_variants import (
+    ModelGraphVariantManager,
+)
 
 
 class _NativeManager:
@@ -24,11 +26,11 @@ def test_stable_manager_facade_switches_native_variant() -> None:
     manager.register("shared", object(), shared)
     manager.register("reasoner_full", object(), full)
 
-    manager.activate(runner, "shared")
+    manager.binding("shared").activate(runner)
     assert runner.cudagraph_manager is manager
     assert manager.execute_model() == "shared"
 
-    manager.activate(runner, "reasoner_full")
+    manager.binding("reasoner_full").activate(runner)
     assert runner.cudagraph_manager is manager
     assert manager.execute_model() == "reasoner_full"
 

@@ -5,12 +5,12 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from vllm.experimental.communicator_registry import CommunicatorRegistry
+from vllm.experimental.archived.communicator_registry import CommunicatorRegistry
 from vllm.experimental.model_instance_registry import (
     CommunicationGroupSpec,
-    ModelInstance,
     ModelSpec,
 )
+from vllm.experimental.archived.model_instance_registry import ModelInstance
 
 
 # 统一的Runner后端协议
@@ -122,7 +122,7 @@ class OmniRunnerBackend:
         worker: Any,
         communicators: CommunicatorRegistry,
     ) -> ModelInstance:
-        from vllm.experimental.omni_runner_adapter import (
+        from vllm.experimental.archived.omni_runner_adapter import (
             EmbeddedOmniDiffusionRunner,
             resolve_omni_diffusion_stage,
         )

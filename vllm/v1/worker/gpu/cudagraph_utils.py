@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from itertools import groupby, product
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, Hashable, NamedTuple, Protocol
 
 import torch
 import torch.nn as nn
@@ -170,9 +170,15 @@ class CudaGraphManager:
         # dispatch() is a plain dict lookup instead of a per-call bisect.
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
 
-        self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+        self._active_resource_variant: Hashable = "default"
+        self._graphs_by_resource_variant: dict[
+            Hashable,
+            dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph],
+        ] = {self._active_resource_variant: {}}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
+        self._captured_resource_variants: set[Hashable] = set()
+        # 兼容已有观测代码；运行时判断使用上面的 variant set。
         self._graphs_captured = False
 
         # Profiling hooks, set only by profile_cudagraph_memory() below: cap
@@ -192,6 +198,50 @@ class CudaGraphManager:
         self.breakable_cg_runner: BreakableCUDAGraphWrapper | None = None
 
         self._init_candidates()
+
+    @property
+    def active_resource_variant(self) -> Hashable:
+        self._ensure_resource_variant_state()
+        return self._active_resource_variant
+
+    @property
+    def graphs(self) -> dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph]:
+        """返回当前资源变体的 FULL graph 存储。"""
+        self._ensure_resource_variant_state()
+        return self._graphs_by_resource_variant.setdefault(
+            self._active_resource_variant, {}
+        )
+
+    def _ensure_resource_variant_state(self) -> None:
+        """兼容绕过 ``__init__`` 构造的旧测试和外部扩展。"""
+        if not hasattr(self, "_active_resource_variant"):
+            self._active_resource_variant = "default"
+        if not hasattr(self, "_graphs_by_resource_variant"):
+            self._graphs_by_resource_variant = {
+                self._active_resource_variant: {}
+            }
+        if not hasattr(self, "_captured_resource_variants"):
+            self._captured_resource_variants = set()
+
+    def activate_resource_variant(self, variant: Hashable) -> None:
+        """选择 capture/dispatch/replay 使用的资源变体。"""
+        hash(variant)
+        self._ensure_resource_variant_state()
+        self._active_resource_variant = variant
+        self._graphs_by_resource_variant.setdefault(variant, {})
+
+    def clear_resource_variant(self, variant: Hashable) -> None:
+        """释放一个资源变体的 FULL 与 PIECEWISE graph。"""
+        self._ensure_resource_variant_state()
+        self._graphs_by_resource_variant.pop(variant, None)
+        self._captured_resource_variants.discard(variant)
+        for wrapper in tuple(CUDAGraphWrapper._all_instances):
+            wrapper.clear_resource_variant(variant)
+        for wrapper in tuple(BreakableCUDAGraphWrapper._all_instances):
+            wrapper.clear_resource_variant(variant)
+        if self._active_resource_variant == variant:
+            self.activate_resource_variant("default")
+        self._graphs_captured = bool(self._captured_resource_variants)
 
     def _build_lora_dispatch_map(self) -> tuple[dict[int, int], int]:
         """Precompute actual num_active_loras -> effective captured case.
@@ -386,7 +436,18 @@ class CudaGraphManager:
                     current_range_start = num_tokens + 1
 
     def needs_capture(self) -> bool:
-        return len(self._capture_descs) > 0
+        return bool(self._capture_descs) and not self._resource_variant_captured()
+
+    def _resource_variant_captured(self) -> bool:
+        self._ensure_resource_variant_state()
+        if self._active_resource_variant in self._captured_resource_variants:
+            return True
+        # 若旧测试或外部扩展只设置了原有布尔量，则将其解释为默认变体。
+        return (
+            self._active_resource_variant == "default"
+            and self._graphs_captured
+            and not self._captured_resource_variants
+        )
 
     def _capture_stream(self, desc: BatchExecutionDescriptor) -> torch.cuda.Stream:
         """Capture on the stream used by the microbatch threads."""
@@ -488,6 +549,8 @@ class CudaGraphManager:
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
 
+        self._ensure_resource_variant_state()
+        self._captured_resource_variants.add(self._active_resource_variant)
         self._graphs_captured = True
 
     def captured_token_counts(self) -> list[int]:
@@ -508,7 +571,11 @@ class CudaGraphManager:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
         effective_loras = self._resolve_effective_loras(num_active_loras)
         key = (num_tokens, effective_loras)
-        if self._graphs_captured and num_tokens > 0 and key in self._candidates:
+        if (
+            self._resource_variant_captured()
+            and num_tokens > 0
+            and key in self._candidates
+        ):
             for desc in self._candidates[key]:
                 if _is_compatible(
                     desc,
@@ -729,6 +796,9 @@ class ModelCudaGraphManager(CudaGraphManager):
                     slot_mapping=slot_mappings,
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
+                    cudagraph_resource_variant=(
+                        self.active_resource_variant
+                    ),
                 ):
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside

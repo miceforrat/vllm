@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+from vllm.experimental.worker.binding import CudaGraphBinding
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,16 @@ class ModelGraphVariantManager:
 
     def get(self, name: str) -> ModelGraphVariant | None:
         return self._variants.get(name)
+
+    def binding(self, name: str) -> CudaGraphBinding:
+        """解析一个已有 variant，返回不负责创建或捕获的激活句柄。"""
+        if name not in self._variants:
+            raise RuntimeError(
+                f"Reasoner graph variant {name!r} was not captured; "
+                f"available={sorted(self._variants)}"
+            )
+        variant = self._variants[name]
+        return CudaGraphBinding(self, name, variant.stream)
 
     def counts(self) -> dict[str, int]:
         return {

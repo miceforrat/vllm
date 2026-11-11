@@ -66,7 +66,9 @@ def main() -> None:
         raise ValueError("Gate P1 is intended for tp_size >= 2")
 
     from vllm import LLM
-    from vllm.experimental.multi_model_worker import WorkerHostedRunnerClient
+    from vllm.experimental.archived.multi_model_worker import (
+        WorkerHostedRunnerClient,
+    )
 
     llm = LLM(
         model=args.model,
@@ -79,7 +81,7 @@ def main() -> None:
         enable_prefix_caching=False,
         disable_log_stats=True,
         worker_extension_cls=(
-            "vllm.experimental.multi_model_worker.MultiModelWorkerExtension"
+            "vllm.experimental.archived.multi_model_worker.MultiModelWorkerExtension"
         ),
     )
     client = WorkerHostedRunnerClient(llm.llm_engine)

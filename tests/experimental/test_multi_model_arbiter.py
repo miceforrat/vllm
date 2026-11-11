@@ -2,7 +2,7 @@
 
 import threading
 
-from vllm.experimental.multi_model_arbiter import (
+from vllm.experimental.archived.multi_model_arbiter import (
     GeneratorExecutionPhase,
     MultiModelResourceArbiter,
 )

@@ -25,7 +25,7 @@ os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.usage.usage_lib import UsageContext
-from vllm.experimental.multi_model_worker import (
+from vllm.experimental.archived.multi_model_worker import (
     AsyncWorkerHostedRunnerClient,
     ModelSpec,
     SchedulerModelRequest,
@@ -286,7 +286,7 @@ async def async_main(args: argparse.Namespace) -> None:
     if args.generator_stream == "green":
         worker_options = {
             "worker_cls": (
-                "vllm.experimental.multi_model_gpu_worker.MultiModelGPUWorker"
+                "vllm.experimental.archived.multi_model_gpu_worker.MultiModelGPUWorker"
             ),
             "additional_config": {
                 "multi_model_runtime": {
@@ -321,7 +321,7 @@ async def async_main(args: argparse.Namespace) -> None:
         enable_prefix_caching=False,
         disable_log_stats=True,
         worker_extension_cls=(
-            "vllm.experimental.multi_model_worker.MultiModelWorkerExtension"
+            "vllm.experimental.archived.multi_model_worker.MultiModelWorkerExtension"
         ),
         **reasoner_execution,
         **worker_options,

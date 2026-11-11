@@ -1541,7 +1541,7 @@ def _replace_active_groups(
     _NODE_COUNT = node_count
     return old_groups
 
-
+#  TP group覆盖机制
 _TP: GroupCoordinator | None = None
 _TP_CONTEXT_OVERRIDE: ContextVar[GroupCoordinator | None] = ContextVar(
     "vllm_tp_context_override", default=None

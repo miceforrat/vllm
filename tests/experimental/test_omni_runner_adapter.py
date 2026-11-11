@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from vllm.experimental.omni_runner_adapter import EmbeddedOmniDiffusionRunner
+from vllm.experimental.archived.omni_runner_adapter import (
+    EmbeddedOmniDiffusionRunner,
+)
 
 
 def test_vae_decode_is_split_into_coarse_temporal_segments() -> None:

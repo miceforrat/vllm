@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from functools import partial
@@ -57,7 +57,7 @@ from vllm.v1.core.kv_cache_utils import (
     update_kv_cache_capacity,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
-from vllm.v1.core.sched.execution_units import ExecutionUnitAdmissionServer
+from vllm.v1.core.sched.execution_units import ExecutionUnitSpec
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
@@ -127,10 +127,13 @@ class EngineCore:
 
         self.vllm_config = vllm_config
         from vllm.experimental.model_instance_registry import (
-            restore_engine_model_registry,
+            create_engine_core_model_registry,
         )
 
-        self.model_registry = restore_engine_model_registry(vllm_config)
+        # ModelRegistry、拓扑规划和 Worker 启动描述只在 EngineCore 创建。
+        self.model_registry = create_engine_core_model_registry(vllm_config)
+        self._model_request_sessions: dict[str, str] = {}
+        self._model_request_futures: dict[str, Future[list[Any]]] = {}
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -144,6 +147,10 @@ class EngineCore:
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
+        # Worker-managed 请求在 Worker 内异步执行。完成等待必须离开
+        # EngineCore 调度线程，否则原生 vLLM 请求无法继续推进。
+        # 在后台等待 Worker-managed 请求完成，避免阻塞 EngineCore 调度线程
+        self._model_request_completion_executor: ThreadPoolExecutor | None = None
         self._pooler_config_logged = False
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
@@ -180,32 +187,7 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
-        self.execution_unit_server: ExecutionUnitAdmissionServer | None = None
-        additional = getattr(vllm_config, "additional_config", None)
-        runtime = (
-            additional.get("multi_model_runtime", {})
-            if isinstance(additional, dict)
-            else {}
-        )
-        green_context = (
-            runtime.get("green_context", {})
-            if isinstance(runtime, dict)
-            else {}
-        )
-        if (
-            isinstance(green_context, dict)
-            and green_context.get("partition_policy") == "dynamic"
-        ):
-            self.execution_unit_server = ExecutionUnitAdmissionServer(
-                self.scheduler.execution_units
-            )
-            self.model_executor.collective_rpc(
-                "configure_execution_unit_scheduler",
-                args=(
-                    self.execution_unit_server.address,
-                    self.execution_unit_server.authkey.hex(),
-                ),
-            )
+        self._configure_execution_slice_scheduler(vllm_config)
         self._initialize_effective_attention_block_size()
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
@@ -282,6 +264,59 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+    def _configure_execution_slice_scheduler(
+        self, vllm_config: VllmConfig
+    ) -> None:
+        """Restore Engine-planned resource variants into the slice scheduler."""
+        additional = getattr(vllm_config, "additional_config", None)
+        runtime = (
+            additional.get("multi_model_runtime", {})
+            if isinstance(additional, dict)
+            else {}
+        )
+        plan_payload = runtime.get("deployment_plan")
+        if plan_payload is None:
+            return
+
+        from vllm.experimental.deployment import EngineDeploymentPlan
+
+        plan = EngineDeploymentPlan.from_rpc_payload(plan_payload)
+        for deployment in plan.deployments:
+            description = deployment.resources
+            names = tuple(
+                variant.name for variant in description.execution_variants
+            )
+            if not names:
+                continue
+            shared = "shared" if "shared" in names else None
+            full = description.default_variant
+            if full == shared:
+                full = next(
+                    (name for name in names if name != shared), full
+                )
+            self.scheduler.execution_units.configure_model(
+                deployment.spec.model_id,
+                full_variant=full,
+                shared_variant=shared,
+                primary=deployment.spec.backend == "vllm",
+                participant_count=max(
+                    1, len(deployment.spec.worker_ranks)
+                ),
+            )
+
+    def _attach_scheduled_execution_slice(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Attach the EngineCore partition decision to one native model batch."""
+        model_id = self.scheduler.execution_units.primary_model_id
+        if model_id is None:
+            return
+        request_ids = tuple(scheduler_output.num_scheduled_tokens)
+        scheduled = self.scheduler.execution_units.schedule_model_batch(
+            model_id, request_ids
+        )
+        scheduler_output.scheduled_execution_slice = scheduled.to_payload()
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -670,6 +705,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        self._attach_scheduled_execution_slice(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -727,6 +763,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            self._attach_scheduled_execution_slice(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -827,9 +864,10 @@ class EngineCore:
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
         self.structured_output_manager.clear_backend()
-        if self.execution_unit_server is not None:
-            self.execution_unit_server.close()
-            self.execution_unit_server = None
+        # shutdown处理
+        if self._model_request_completion_executor is not None:
+            self._model_request_completion_executor.shutdown(wait=True)
+            self._model_request_completion_executor = None
         if self.model_executor:
             self.model_executor.shutdown()
         if self.scheduler:
@@ -1082,6 +1120,156 @@ class EngineCore:
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
+    def wait_model_request_completion(self, job_id: str) -> Future[list[Any]]:
+        """返回由 EngineCore 逐 slice 驱动的请求完成 Future。"""
+        try:
+            return self._model_request_futures[str(job_id)]
+        except KeyError as exc:
+            raise KeyError(f"Unknown model request {job_id!r}") from exc
+
+    def _drive_model_request(
+        self,
+        model_id: str,
+        request_id: str,
+        requested_variant: str,
+        first_workers: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """像 LLM batch 一样，由 Core 反复下发一个模型执行 slice。"""
+        workers = first_workers
+        while True:
+            boundaries = [worker.get("next_slice") for worker in workers]
+            if not boundaries or any(boundary is None for boundary in boundaries):
+                raise RuntimeError(
+                    f"Workers returned no next slice for {request_id!r}"
+                )
+            if any(boundary != boundaries[0] for boundary in boundaries[1:]):
+                raise RuntimeError(
+                    f"Workers disagreed on next slice for {request_id!r}: "
+                    f"{boundaries!r}"
+                )
+            boundary = boundaries[0]
+            assert isinstance(boundary, dict)
+            scheduled = self.scheduler.execution_units.schedule_slice(
+                model_id,
+                request_id,
+                ExecutionUnitSpec(
+                    str(boundary["kind"]),
+                    None
+                    if boundary.get("index") is None
+                    else int(boundary["index"]),
+                    {"requested_variant": requested_variant},
+                ),
+            )
+            workers = self.model_executor.collective_rpc(
+                "execute_model_request_slice",
+                args=(request_id, scheduled.to_payload()),
+            )
+            done = [bool(worker.get("request_done")) for worker in workers]
+            if any(value != done[0] for value in done[1:]):
+                raise RuntimeError(
+                    f"Workers disagreed on completion for {request_id!r}"
+                )
+            if done and done[0]:
+                return workers
+
+    def open_model_request(
+        self,
+        model_id: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """在 EngineCore 建立请求会话，但不向 Frontend暴露执行协议。"""
+        spec = self.model_registry.get(str(model_id))
+        request_id = str(request_id)
+        if request_id in self._model_request_sessions:
+            raise ValueError(f"Model request {request_id!r} already exists")
+        self._model_request_sessions[request_id] = spec.model_id
+        self.scheduler.execution_units.set_model_demand(spec.model_id, True)
+        return {"model_id": spec.model_id, "request_id": request_id}
+
+    def submit_model_request(
+        self,
+        model_id: str,
+        request_id: str,
+        request: Any,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """由 EngineCore 将规范化请求直接路由到 Scheduler 或 Worker。"""
+        spec = self.model_registry.get(str(model_id))
+        request_id = str(request_id)
+        owner = self._model_request_sessions.get(request_id)
+        if owner != spec.model_id:
+            raise RuntimeError(
+                f"Model request {request_id!r} has no matching open session"
+            )
+        if spec.backend == "vllm":
+            if not isinstance(request, EngineCoreRequest):
+                raise TypeError(
+                    "Scheduler-managed requests must be preprocessed into "
+                    "EngineCoreRequest"
+                )
+            core_request, request_wave = self.preprocess_add_request(request)
+            self.add_request(core_request, request_wave)
+            return {
+                "model_id": spec.model_id,
+                "request_id": request_id,
+                "accepted": True,
+            }
+
+        values = dict(options or {})
+        variant = str(values.pop("variant", "auto"))
+        max_steps = int(values.pop("max_steps", 4096))
+        if values:
+            raise ValueError(
+                f"Unknown model request options: {sorted(values)!r}"
+            )
+        workers = self.model_executor.collective_rpc(
+            "start_model_request",
+            args=(spec.model_id, request, variant, max_steps, request_id),
+        )
+        if not workers:
+            raise RuntimeError(
+                f"No Worker accepted model request {request_id!r}"
+            )
+        executor = self._model_request_completion_executor
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=4,
+                thread_name_prefix="model-request-driver",
+            )
+            self._model_request_completion_executor = executor
+        future = executor.submit(
+            self._drive_model_request,
+            spec.model_id,
+            request_id,
+            variant,
+            workers,
+        )
+        self._model_request_futures[request_id] = future
+        return {
+            "model_id": spec.model_id,
+            "request_id": request_id,
+            "accepted": True,
+            "workers": workers,
+        }
+
+    def finish_model_request(
+        self, model_id: str, request_id: str
+    ) -> dict[str, Any]:
+        """释放 EngineCore 为请求维护的 admission 状态。"""
+        spec = self.model_registry.get(str(model_id))
+        request_id = str(request_id)
+        owner = self._model_request_sessions.pop(request_id, None)
+        if owner is None:
+            raise KeyError(f"Unknown model request session {request_id!r}")
+        if owner != spec.model_id:
+            raise RuntimeError(
+                f"Model request {request_id!r} belongs to {owner!r}"
+            )
+        self._model_request_futures.pop(request_id, None)
+        return self.scheduler.execution_units.set_model_demand(
+            spec.model_id, False
+        )
+
     def register_model_spec(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Commit one successfully deployed model to the Engine registry."""
         from vllm.experimental.model_instance_registry import ModelSpec
@@ -1111,9 +1299,6 @@ class EngineCore:
         return self.scheduler.execution_units.register_request(
             model_id, request_id, units
         )
-
-    def set_execution_primary_demand(self, active: bool) -> dict[str, Any]:
-        return self.scheduler.execution_units.set_primary_demand(active)
 
     def offer_execution_unit(
         self,

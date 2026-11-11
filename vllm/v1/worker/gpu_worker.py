@@ -342,6 +342,17 @@ class Worker(WorkerBase):
         checkpoint_restore_distributed_state()
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+        # 多模型 Worker 可以为每个 Runner 提供独立的物理显存 Binding。
+        # 这里只替换 allocation context；KV cache 的容量计算、布局和 block
+        # 规划仍完全沿用原生 vLLM 逻辑。
+        memory_binding = getattr(
+            getattr(self, "model_runner", None),
+            "_vllm_memory_binding",
+            None,
+        )
+        if memory_binding is not None:
+            return memory_binding.allocation_context(tag)
+
         if (
             current_platform.is_cuda_alike()
             and not self.vllm_config.model_config.enable_cumem_allocator

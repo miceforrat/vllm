@@ -12,16 +12,18 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from vllm.experimental.communicator_registry import CommunicatorRegistry
+from vllm.experimental.archived.communicator_registry import CommunicatorRegistry
 from vllm.experimental.model_instance_registry import (
     CommunicationGroupSpec,
-    ModelInstance,
-    ModelInstanceRegistry,
     ModelRegistry,
     ModelSpec,
 )
+from vllm.experimental.archived.model_instance_registry import (
+    ModelInstance,
+    ModelInstanceRegistry,
+)
 from vllm.experimental.multi_model_topology import TopologyPlan
-from vllm.experimental.runner_factory import RunnerFactory
+from vllm.experimental.archived.runner_factory import RunnerFactory
 
 
 @dataclass(frozen=True)

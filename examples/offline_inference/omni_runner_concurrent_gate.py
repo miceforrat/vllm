@@ -19,7 +19,7 @@ os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 
 import torch
 
-from vllm.experimental.omni_runner_adapter import (
+from vllm.experimental.archived.omni_runner_adapter import (
     EmbeddedOmniDiffusionRunner,
     resolve_omni_diffusion_stage,
 )

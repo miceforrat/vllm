@@ -131,18 +131,6 @@ class AsyncLLM(EngineClient):
         maybe_register_config_serialize_by_value()
 
         self.vllm_config = vllm_config
-        from vllm.experimental.multi_model_topology import TopologyPlanner
-
-        self.multi_model_topology_planner = TopologyPlanner(
-            vllm_config.parallel_config
-        )
-        from vllm.experimental.model_instance_registry import (
-            create_engine_model_registry,
-        )
-
-        self.model_registry = create_engine_model_registry(
-            vllm_config, self.multi_model_topology_planner
-        )
         self._elastic_ep_lock = asyncio.Lock()
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -563,7 +551,7 @@ class AsyncLLM(EngineClient):
                 )
 
             for child_request in child_requests:
-                await self.engine_core.add_request_async(child_request)
+                await self._dispatch_prepared_request(child_request)
                 if self.log_requests:
                     logger.info("Added request %s.", child_request.request_id)
         except BaseException:
@@ -588,10 +576,16 @@ class AsyncLLM(EngineClient):
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(request)
+        await self._dispatch_prepared_request(request)
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
+
+    async def _dispatch_prepared_request(
+        self, request: EngineCoreRequest
+    ) -> None:
+        """把 Frontend 已预处理的请求交给 EngineCore。"""
+        await self.engine_core.add_request_async(request)
 
     async def _add_streaming_input_request(
         self,

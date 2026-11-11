@@ -20,7 +20,7 @@ os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 
 import torch
 
-from vllm.experimental.multi_model_worker import (
+from vllm.experimental.archived.multi_model_worker import (
     ModelSpec,
     SchedulerModelRequest,
     WorkerHostedRunnerClient,
@@ -546,7 +546,7 @@ def main() -> None:
     if args.generator_stream == "green":
         worker_options = {
             "worker_cls": (
-                "vllm.experimental.multi_model_gpu_worker."
+                "vllm.experimental.archived.multi_model_gpu_worker."
                 "MultiModelGPUWorker"
             ),
             "additional_config": {
@@ -586,7 +586,7 @@ def main() -> None:
         enable_prefix_caching=False,
         disable_log_stats=True,
         worker_extension_cls=(
-            "vllm.experimental.multi_model_worker.MultiModelWorkerExtension"
+            "vllm.experimental.archived.multi_model_worker.MultiModelWorkerExtension"
         ),
         **reasoner_execution,
         **worker_options,

@@ -29,7 +29,7 @@ import logging
 import threading
 import weakref
 from collections.abc import Callable
-from typing import Any, ClassVar, TypeVar
+from typing import Any, ClassVar, Hashable, TypeVar
 
 import torch
 
@@ -288,7 +288,9 @@ class BreakableCUDAGraphWrapper:
         self.graph_pool = current_platform.get_global_graph_pool()
         self.is_debugging_mode = logger.isEnabledFor(logging.DEBUG)
 
-        self.entries: dict[BatchDescriptor, _BreakableEntry] = {}
+        self._entries_by_resource_variant: dict[
+            Hashable, dict[BatchDescriptor, _BreakableEntry]
+        ] = {"default": {}}
         # Diagnostic counters are deliberately host-only. They make it
         # possible to distinguish "the wrapper exists" from "measured model
         # execution actually replayed a breakable graph" without changing
@@ -317,8 +319,28 @@ class BreakableCUDAGraphWrapper:
     def cudagraph_wrapper(self) -> BreakableCUDAGraphWrapper:
         return self
 
+    @property
+    def entries(self) -> dict[BatchDescriptor, _BreakableEntry]:
+        """保留原生公开接口；未显式指定资源变体时查看默认变体。"""
+        return self._entries_by_resource_variant.setdefault("default", {})
+
+    @entries.setter
+    def entries(self, entries: dict[BatchDescriptor, _BreakableEntry]) -> None:
+        self._entries_by_resource_variant["default"] = entries
+
     def clear_graphs(self) -> None:
-        self.entries.clear()
+        self._entries_by_resource_variant.clear()
+        self._entries_by_resource_variant["default"] = {}
+
+    def clear_resource_variant(self, variant: Hashable) -> None:
+        """只清理一个资源变体捕获的 breakable graph。"""
+        self._entries_by_resource_variant.pop(variant, None)
+
+    def resource_variant_entries(
+        self, variant: Hashable
+    ) -> dict[BatchDescriptor, _BreakableEntry]:
+        """返回指定资源变体的 entry 只读用途视图。"""
+        return self._entries_by_resource_variant.get(variant, {})
 
     # --- dispatch --------------------------------------------------------
 
@@ -342,10 +364,13 @@ class BreakableCUDAGraphWrapper:
             return self.runnable(*args, **kwargs)
 
         assert batch_descriptor is not None
-        entry = self.entries.get(batch_descriptor)
+        entries = self._entries_by_resource_variant.setdefault(
+            forward_context.cudagraph_resource_variant, {}
+        )
+        entry = entries.get(batch_descriptor)
         if entry is None:
             entry = _BreakableEntry(batch_descriptor=batch_descriptor)
-            self.entries[batch_descriptor] = entry
+            entries[batch_descriptor] = entry
 
         if entry.capture is None:
             self.capture_calls += 1

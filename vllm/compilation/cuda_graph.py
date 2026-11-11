@@ -7,7 +7,7 @@ import weakref
 from collections import Counter
 from collections.abc import Callable
 from contextlib import ExitStack
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Hashable
 from unittest.mock import patch
 
 import torch
@@ -204,7 +204,9 @@ class CUDAGraphWrapper:
         self.cudagraph_options = cudagraph_options
         # the entries for different batch descriptors that we need to capture
         # cudagraphs for.
-        self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
+        self._entries_by_resource_variant: dict[
+            Hashable, dict[BatchDescriptor, CUDAGraphEntry]
+        ] = {"default": {}}
 
         CUDAGraphWrapper._all_instances.add(self)
 
@@ -229,8 +231,33 @@ class CUDAGraphWrapper:
     def cudagraph_wrapper(self) -> "CUDAGraphWrapper":
         return self
 
+    @property
+    def concrete_cudagraph_entries(
+        self,
+    ) -> dict[BatchDescriptor, CUDAGraphEntry]:
+        """保留原生公开接口；未显式指定资源变体时查看默认变体。"""
+        return self._entries_by_resource_variant.setdefault("default", {})
+
+    @concrete_cudagraph_entries.setter
+    def concrete_cudagraph_entries(
+        self, entries: dict[BatchDescriptor, CUDAGraphEntry]
+    ) -> None:
+        # 兼容旧的实验路径保存并恢复默认变体 entry 字典。
+        self._entries_by_resource_variant["default"] = entries
+
     def clear_graphs(self) -> None:
-        self.concrete_cudagraph_entries.clear()
+        self._entries_by_resource_variant.clear()
+        self._entries_by_resource_variant["default"] = {}
+
+    def clear_resource_variant(self, variant: Hashable) -> None:
+        """只清理一个资源变体捕获的 piecewise graph。"""
+        self._entries_by_resource_variant.pop(variant, None)
+
+    def resource_variant_entries(
+        self, variant: Hashable
+    ) -> dict[BatchDescriptor, CUDAGraphEntry]:
+        """返回指定资源变体的 entry 只读用途视图。"""
+        return self._entries_by_resource_variant.get(variant, {})
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any | None:
         if not is_forward_context_available():
@@ -256,13 +283,16 @@ class CUDAGraphWrapper:
             return self.runnable(*args, **kwargs)
 
         assert batch_descriptor is not None
-        if batch_descriptor not in self.concrete_cudagraph_entries:
+        entries = self._entries_by_resource_variant.setdefault(
+            forward_context.cudagraph_resource_variant, {}
+        )
+        if batch_descriptor not in entries:
             # create a new entry for this batch descriptor
-            self.concrete_cudagraph_entries[batch_descriptor] = CUDAGraphEntry(
+            entries[batch_descriptor] = CUDAGraphEntry(
                 batch_descriptor=batch_descriptor
             )
 
-        entry = self.concrete_cudagraph_entries[batch_descriptor]
+        entry = entries[batch_descriptor]
 
         if entry.cudagraph is None:
             if self.cudagraph_options.debug_log_enable:
