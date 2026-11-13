@@ -7,29 +7,10 @@ import threading
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Mapping
 
-# TODO: 这个描述的信息基本和通信的desc重合(详见./worker/resource_desc.py),未来考虑直接把二者结合起来
-@dataclass(frozen=True)
-class CommunicationGroupSpec:
-    """Engine-planned communication domain materialized by each worker."""
+from vllm.experimental.communication import CommunicationGroupDescription
 
-    group_id: str
-    parallel_dimension: str
-    ranks: tuple[int, ...]
-    backend: str | None = None
-    # 是否创建gpu侧的communicator
-    use_device_communicator: bool = True
-
-    @classmethod
-    def from_rpc_payload(
-        cls, payload: Mapping[str, Any] | "CommunicationGroupSpec"
-    ) -> "CommunicationGroupSpec":
-        if isinstance(payload, cls):
-            return payload
-        values = dict(payload)
-        values["ranks"] = tuple(int(rank) for rank in values["ranks"])
-        return cls(**values)
-
-
+# 仅供 archived 代码兼容；现役代码统一使用 CommunicationGroupDescription。
+CommunicationGroupSpec = CommunicationGroupDescription
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -48,7 +29,7 @@ class ModelSpec:
     # 该模型放在哪些rank上
     worker_ranks: tuple[int, ...] = ()
     # 该模型使用的通信组
-    communication_groups: tuple[CommunicationGroupSpec, ...] = ()
+    communication_groups: tuple[CommunicationGroupDescription, ...] = ()
     load_format: str = "default"
     # 仅对特定后端生效的配置项
     backend_options: Mapping[str, Any] = field(default_factory=dict)
@@ -62,7 +43,7 @@ class ModelSpec:
             int(rank) for rank in values.get("worker_ranks", ())
         )
         values["communication_groups"] = tuple(
-            CommunicationGroupSpec.from_rpc_payload(group)
+            CommunicationGroupDescription.from_rpc_payload(group)
             for group in values.get("communication_groups", ())
         )
         return cls(**values)
@@ -74,7 +55,7 @@ class ModelSpec:
         self,
         *,
         worker_ranks: tuple[int, ...],
-        communication_groups: tuple[CommunicationGroupSpec, ...],
+        communication_groups: tuple[CommunicationGroupDescription, ...],
     ) -> "ModelSpec":
         return replace(
             self,
@@ -146,7 +127,6 @@ def create_engine_core_model_registry(vllm_config: Any) -> ModelRegistry:
         ModelDeployment,
     )
     from vllm.experimental.worker.resource_desc import (
-        CommunicationGroupDescription,
         ExecutionVariantDescription,
         MemoryResourceDescription,
         ResourceDescription,

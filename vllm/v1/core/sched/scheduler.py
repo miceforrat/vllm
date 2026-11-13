@@ -38,7 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.sched.execution_units import ExecutionUnitScheduler
+from vllm.v1.core.sched.execution_slice_scheduler import ExecutionSliceScheduler
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -90,7 +90,7 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
-        self.execution_units = ExecutionUnitScheduler()
+        self.execution_slices = ExecutionSliceScheduler()
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -1482,7 +1482,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
-            execution_unit_state=self.execution_units.snapshot(),
+            execution_slice_state=self.execution_slices.snapshot(),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

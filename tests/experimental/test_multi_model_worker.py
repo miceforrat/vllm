@@ -192,6 +192,7 @@ def test_submit_routes_runtime_model_to_worker_rpc() -> None:
 def test_worker_skips_model_not_placed_on_its_rank() -> None:
     worker = MultiModelWorkerExtension()
     worker.rank = 2
+    worker._vllm_model_instance_registry = ModelInstanceRegistry()
 
     result = worker.register_model(
         ModelSpec(

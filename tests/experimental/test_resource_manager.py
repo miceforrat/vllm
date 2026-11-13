@@ -4,8 +4,8 @@ from contextlib import contextmanager
 
 import pytest
 
+from vllm.experimental.communication import CommunicationGroupDescription
 from vllm.experimental.worker.resource_desc import (
-    CommunicationGroupDescription,
     ExecutionVariantDescription,
     MemoryResourceDescription,
     ResourceDescription,

@@ -56,6 +56,15 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--concurrent-repeats", type=int, default=3)
     parser.add_argument(
+        "--reasoner-arrival-delay-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "并发阶段先提交 Generator，再延迟指定秒数提交 Reasoner；"
+            "用于覆盖不同 diffusion/VAE 阶段的 admission。"
+        ),
+    )
+    parser.add_argument(
         "--concurrent-generator-variant",
         choices=("auto", "shared"),
         default="auto",
@@ -333,6 +342,13 @@ def main() -> None:
     completion = None
     for index in range(args.concurrent_repeats):
         wall_started = time.perf_counter()
+        generator_handle = start_generator(
+            f"container-concurrent-{index}",
+            args.concurrent_generator_variant,
+        )
+        if args.reasoner_arrival_delay_seconds > 0:
+            time.sleep(args.reasoner_arrival_delay_seconds)
+        reasoner_started = time.perf_counter()
         reasoner_handle = engine.submit(
             "reasoner",
             {
@@ -341,12 +357,8 @@ def main() -> None:
                 "use_tqdm": False,
             },
         )
-        generator_handle = start_generator(
-            f"container-concurrent-{index}",
-            args.concurrent_generator_variant,
-        )
         reasoner_outputs = reasoner_handle.result()
-        reasoner_seconds = time.perf_counter() - wall_started
+        reasoner_seconds = time.perf_counter() - reasoner_started
         completion = reasoner_outputs[0].outputs[0]
         generator_result = wait_generator(generator_handle)
         concurrent_rows.append(
@@ -354,6 +366,9 @@ def main() -> None:
                 "reasoner_seconds": reasoner_seconds,
                 "generator_seconds": float(generator_result["seconds"]),
                 "host_wall_seconds": time.perf_counter() - wall_started,
+                "reasoner_arrival_delay_seconds": (
+                    args.reasoner_arrival_delay_seconds
+                ),
             }
         )
         print(
@@ -384,6 +399,9 @@ def main() -> None:
                 args.concurrent_generator_variant
             ),
             "warmups": args.warmups,
+            "reasoner_arrival_delay_seconds": (
+                args.reasoner_arrival_delay_seconds
+            ),
             "repeats": args.repeats,
             "concurrent_repeats": args.concurrent_repeats,
         },

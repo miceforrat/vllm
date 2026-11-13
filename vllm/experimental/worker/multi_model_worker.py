@@ -8,6 +8,7 @@ import time
 import uuid
 from typing import Any
 
+from vllm.experimental.communication import CommunicationGroupDescription
 from vllm.experimental.deployment import EngineDeploymentPlan
 from vllm.experimental.model_instance_registry import ModelSpec
 from vllm.experimental.worker.exec_unit import LLMExecUnit, OmniModelExecUnit
@@ -15,9 +16,7 @@ from vllm.experimental.worker.mini_container import (
     MiniContainer,
     MiniContainerRegistry,
 )
-from vllm.experimental.worker.model_lifecycle import NativeGPUWorkerLifecycle
 from vllm.experimental.worker.resource_desc import (
-    CommunicationGroupDescription,
     ExecutionVariantDescription,
     MemoryResourceDescription,
     ResourceDescription,
@@ -29,7 +28,7 @@ from vllm.experimental.worker.resource_manager import (
     GCStreamManager,
     MemoryManager,
 )
-from vllm.v1.core.sched.execution_units import ScheduledExecutionSlice
+from vllm.v1.core.sched.execution_slice_scheduler import ScheduledExecutionSlice
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 
@@ -237,10 +236,10 @@ class MultiModelWorker(GPUWorker):
             raise
 
         scheduler_container = self.scheduler_container
-        scheduler_container.attach_lifecycle(
-            NativeGPUWorkerLifecycle(
-                self, scheduler_container, self._graph_manager
-            )
+        scheduler_container.exec_unit.attach_native_runtime(
+            self,
+            scheduler_container,
+            self._graph_manager,
         )
         scheduler_container.exec_unit.bind_step_executor(
             lambda work: GPUWorker.execute_model(self, work)
@@ -309,10 +308,15 @@ class MultiModelWorker(GPUWorker):
             "active": True,
         }
 
-    def recv_model_work(self, model_id: str, work: Any) -> dict[str, Any]:
+    def recv_model_work(
+        self,
+        model_id: str,
+        work: Any,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
         """把新请求交给指定的长期 ExecUnit。也就是说, 必须要已有模型才能转交"""
         container = self._container_registry.get(model_id)
-        container.recv_job(work)
+        container.recv_job(work, request_id=request_id)
         return {
             "model_id": model_id,
             "rank": self.rank,
@@ -320,11 +324,15 @@ class MultiModelWorker(GPUWorker):
         }
 
     def step_model(
-        self, model_id: str, variant_name: str | None = None
+        self,
+        model_id: str,
+        variant_name: str | None = None,
+        request_id: str | None = None,
     ) -> Any:
         """在指定资源变体中推进模型一个执行单元。"""
-        return self._container_registry.get(model_id).step(
-            variant_name=variant_name
+        return self._container_registry.get(model_id).execute_slice(
+            variant_name=variant_name,
+            request_id=request_id,
         )
 
     def execute_slice(
@@ -341,9 +349,11 @@ class MultiModelWorker(GPUWorker):
             self._last_execution_epoch, decision.execution_epoch
         )
         container = self._container_registry.get(decision.model_id)
-        return container.step(
+        return container.execute_slice(
+            descriptor=decision.descriptor,
             work=work,
             variant_name=decision.resource_variant,
+            request_id=decision.request_id,
         )
 
     def start_model_request(
@@ -361,9 +371,17 @@ class MultiModelWorker(GPUWorker):
         with self._model_jobs_lock:
             if job_id in self._model_jobs:
                 raise ValueError(f"Model job {job_id!r} already exists")
+            model_driver_active = any(
+                state["model_id"] == model_id
+                for state in self._model_jobs.values()
+            )
         container = self._container_registry.get(model_id)
-        container.recv_job(work)
-        kind, index = container.exec_unit.next_slice_spec()
+        container.recv_job(work, request_id=job_id)
+        spec = (
+            None
+            if model_driver_active
+            else container.exec_unit.next_slice_spec(job_id)
+        )
         with self._model_jobs_lock:
             self._model_jobs[job_id] = {
                 "model_id": model_id,
@@ -376,7 +394,7 @@ class MultiModelWorker(GPUWorker):
             "job_id": job_id,
             "model_id": model_id,
             "rank": self.rank,
-            "next_slice": {"kind": kind, "index": index},
+            "next_slice": None if spec is None else spec.to_payload(),
         }
 
     def execute_model_request_slice(
@@ -394,28 +412,43 @@ class MultiModelWorker(GPUWorker):
             if state["step_count"] > state["max_steps"]:
                 raise RuntimeError(
                     f"Model request {job_id!r} exceeded "
-                    f"{state['max_steps']} execution units"
+                    f"{state['max_steps']} execution slices"
                 )
 
         decision = ScheduledExecutionSlice.from_payload(scheduled)
-        if decision.request_id != job_id:
-            raise ValueError(
-                f"Scheduled request {decision.request_id!r} does not match "
-                f"Worker job {job_id!r}"
-            )
         container = self._container_registry.get(state["model_id"])
         result = self.execute_slice(decision)
-        request_done = bool(container._result_field(result, "request_done"))
+        model_idle = bool(container._result_field(result, "request_done"))
+        result_metadata = dict(container._result_field(result, "metadata"))
+        finished_request_ids = tuple(
+            str(value)
+            for value in result_metadata.get("finished_request_ids", ())
+        )
         response = {
             "job_id": job_id,
             "model_id": state["model_id"],
             "rank": self.rank,
-            "request_done": request_done,
-            "kind": container._result_field(result, "kind"),
-            "index": container._result_field(result, "index"),
+            "request_done": model_idle,
+            "finished_request_ids": finished_request_ids,
+            "sequence_no": container._result_field(result, "sequence_no"),
+            "tags": sorted(container._result_field(result, "tags")),
+            "metadata": result_metadata,
             "step_count": state["step_count"],
         }
-        if request_done:
+        for finished_request_id in finished_request_ids:
+            # 驱动请求的 job 记录在整个 model-level batch loop 中保留；否则它
+            # 自己较早完成后，后续 wave 将失去计数和模型归属。
+            if finished_request_id == job_id and not model_idle:
+                continue
+            with self._model_jobs_lock:
+                finished_state = self._model_jobs.pop(
+                    finished_request_id, None
+                )
+            if finished_state is not None:
+                response.setdefault("finished_seconds", {})[
+                    finished_request_id
+                ] = time.perf_counter() - finished_state["started"]
+        if model_idle:
             assignment = container.assignment(decision.resource_variant)
             import torch
 
@@ -424,10 +457,14 @@ class MultiModelWorker(GPUWorker):
             completion.synchronize()
             response["seconds"] = time.perf_counter() - state["started"]
             with self._model_jobs_lock:
-                self._model_jobs.pop(job_id, None)
+                for active_job_id, active_state in tuple(
+                    self._model_jobs.items()
+                ):
+                    if active_state["model_id"] == state["model_id"]:
+                        self._model_jobs.pop(active_job_id, None)
         else:
-            kind, index = container.exec_unit.next_slice_spec()
-            response["next_slice"] = {"kind": kind, "index": index}
+            spec = container.exec_unit.next_slice_spec()
+            response["next_slice"] = spec.to_payload()
         return response
 
     def unregister_model(self, model_id: str) -> dict[str, Any]:
@@ -450,7 +487,7 @@ class MultiModelWorker(GPUWorker):
         return self.scheduler_container.determine_available_memory()
 
     def initialize_from_config(self, kv_cache_config: Any) -> None:
-        self.scheduler_container.initialize_from_config(kv_cache_config)
+        self.scheduler_container.initialize_runtime(kv_cache_config)
 
     def compile_or_warm_up_model(self):
         return self.scheduler_container.compile_or_warm_up_model()
@@ -492,7 +529,7 @@ class MultiModelWorker(GPUWorker):
         # GPUWorker 在 profiling、warmup 和 CUDA Graph capture 期间会直接
         # 构造 SchedulerOutput；这些调用不经过 EngineCore，因而没有 slice
         # 决策。使用部署计划中的默认变体，不能把 ``auto`` 留给 Worker 推断。
-        return self.scheduler_container.step(
+        return self.scheduler_container.execute_slice(
             work=scheduler_output,
             variant_name=None,
         )

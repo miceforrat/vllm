@@ -6,10 +6,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
-from vllm.experimental.model_instance_registry import (
-    CommunicationGroupSpec,
-    ModelSpec,
-)
+from vllm.experimental.communication import CommunicationGroupDescription
+from vllm.experimental.model_instance_registry import ModelSpec
 
 
 @dataclass(frozen=True)
@@ -18,7 +16,7 @@ class TopologyPlan:
 
     model_id: str
     worker_ranks: tuple[int, ...]
-    communication_groups: tuple[CommunicationGroupSpec, ...]
+    communication_groups: tuple[CommunicationGroupDescription, ...]
 
     @classmethod
     def from_rpc_payload(
@@ -31,7 +29,7 @@ class TopologyPlan:
             int(rank) for rank in values["worker_ranks"]
         )
         values["communication_groups"] = tuple(
-            CommunicationGroupSpec.from_rpc_payload(group)
+            CommunicationGroupDescription.from_rpc_payload(group)
             for group in values.get("communication_groups", ())
         )
         return cls(**values)
@@ -94,7 +92,7 @@ class TopologyPlanner:
             groups = spec.communication_groups
         else:
             groups = (
-                CommunicationGroupSpec(
+                CommunicationGroupDescription(
                     group_id=f"{spec.model_id}-tp",
                     parallel_dimension="tp",
                     ranks=ranks,

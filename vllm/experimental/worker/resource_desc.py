@@ -12,40 +12,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
+from vllm.experimental.communication import CommunicationGroupDescription
+
 StreamKind = Literal["default", "dedicated", "green_context"]
 MemoryKind = Literal["default", "tagged_pool"]
-
-
-@dataclass(frozen=True)
-class CommunicationGroupDescription:
-    """Engine 规划、由各 Worker 实例化的通信资源描述。"""
-
-    group_id: str
-    parallel_dimension: str
-    ranks: tuple[int, ...]
-    backend: str | None = None
-    use_device_communicator: bool = True
-
-    @classmethod
-    def from_rpc_payload(
-        cls,
-        payload: Mapping[str, Any] | CommunicationGroupDescription | Any,
-    ) -> CommunicationGroupDescription:
-        """恢复 RPC payload，并兼容旧 CommunicationGroupSpec。"""
-        if isinstance(payload, cls):
-            return payload
-        if isinstance(payload, Mapping):
-            values = dict(payload)
-        else:
-            values = {
-                "group_id": payload.group_id,
-                "parallel_dimension": payload.parallel_dimension,
-                "ranks": payload.ranks,
-                "backend": payload.backend,
-                "use_device_communicator": payload.use_device_communicator,
-            }
-        values["ranks"] = tuple(int(rank) for rank in values["ranks"])
-        return cls(**values)
 
 
 @dataclass(frozen=True)

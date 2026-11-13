@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """已归档的 Worker-local 资源变体协调器。
 
-动态分区决策现由 EngineCore ``ExecutionUnitScheduler`` 统一完成。本文件仅
+动态分区决策现由 EngineCore ``ExecutionSliceScheduler`` 统一完成。本文件仅
 保留旧实验实现，不能再由活动 Worker 路径导入。
 """
 

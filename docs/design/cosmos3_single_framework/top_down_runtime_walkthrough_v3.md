@@ -24,7 +24,7 @@ LLMEngine / AsyncLLM                         Engine frontend
 EngineCore
   |-- ModelRegistry                         authoritative deployment state
   |-- Scheduler
-  |-- ExecutionUnitScheduler                diffusion unit admission/state
+  |-- ExecutionSliceScheduler                diffusion unit admission/state
   `-- Executor
         |
         v
@@ -188,7 +188,7 @@ ModelSpec
   -> frontend ModelRegistry.register(planned_spec)
 ```
 
-Omni backend 在创建时通过 [`CommunicatorRegistry.acquire()`](../../../vllm/experimental/communicator_registry.py) 将 Engine 下发的 `CommunicationGroupSpec` 物化成 runner-owned TP group。当前 homogeneous TP gate 要求 Generator placement 与 vLLM TP ranks 相同；这不是最终拓扑模型的理论限制。
+Omni backend 在创建时将 Engine 下发的 `CommunicationGroupDescription` 物化成 runner-owned TP group。当前 homogeneous TP gate 要求 Generator placement 与 vLLM TP ranks 相同；这不是最终拓扑模型的理论限制。
 
 ---
 
@@ -212,7 +212,7 @@ submit(model_id, request)
 
 ### 6.1 Reasoner demand 与时间字段
 
-动态策略下，vLLM 请求执行前后调用 `set_primary_demand(True/False)`。当前名称仍带 primary 语义，后续应改成通用 resource claim/activity token。
+动态策略下，请求执行前后调用 `set_model_demand(model_id, True/False)`，以模型 ID 记录当前资源需求。
 
 报告中的：
 
@@ -225,26 +225,29 @@ submit(model_id, request)
 
 ---
 
-## 7. Engine Scheduler 如何理解 diffusion execution unit
+## 7. Engine Scheduler 如何调度 execution slice
 
-[`ExecutionUnitScheduler`](../../../vllm/v1/core/sched/execution_units.py#L73) 维护每个 diffusion request 的 unit cursor 和状态：
+[`ExecutionSliceScheduler`](../../../vllm/v1/core/sched/execution_slice_scheduler.py) 接收 EngineCore 已经取得的 slice boundary，根据当前各模型 demand 选择资源变体，并分配全局 execution epoch。
 
 ```text
-PENDING -> ADMITTED -> RUNNING -> COMPLETED / FAILED
+ExecutionSliceDescriptor + model demand
+  -> resource variant (full/shared)
+  -> ScheduledExecutionSlice
+  -> Worker
 ```
 
-Cosmos3 当前产生：
+vLLM 的原生 scheduler batch 和 Omni provider 产生的细粒度 slice 都进入这一入口。Cosmos3 当前产生：
 
 ```text
 preparing
 denoising step 0 ... N-1
 vae segment 0 ... M-1
-complete
+VAE block 0 ... M-1
 ```
 
-[`ExecutionUnitAdmissionServer`](../../../vllm/v1/core/sched/execution_units.py#L256) 将 Worker 内 phase boundary 请求转交 EngineCore 状态机。Scheduler 根据当前 demand 返回 `generator_full` 或 `shared`。
+旧 Worker 通过 Unix socket 反向请求调度的 `ExecutionSliceAdmissionServer/Client` 已归档至 `vllm/experimental/archived/execution_slice_admission.py`。当前路径由 EngineCore 主动逐 slice 下发，不再存在反向 admission server。
 
-它目前解决的是“Engine 看得见并决定每个 diffusion unit 的 mode”，还不是完整 N-model ResourceScheduler：没有公平性、deadline/SLO、跨模型优先级或统一 capacity admission。
+它目前解决的是“Engine 看得见并决定每个 slice 的资源变体”，还不是完整 N-model ResourceScheduler：没有公平性、deadline/SLO、跨模型优先级或统一 capacity admission。
 
 ---
 
@@ -290,7 +293,7 @@ Omni adapter 的 allocation/request context 将权重、SeaCache、UND cache 和
 
 ### 9.3 Communicator
 
-Engine 规划 `CommunicationGroupSpec`，Worker `CommunicatorRegistry` 创建并按 owner/refcount 管理，Omni adapter 安装兼容 group view。长期接口应是 model/runner-scoped communicator provider，彻底避免 Omni module-level group globals。
+Engine 规划共享的 `CommunicationGroupDescription`，Worker `CommManager` 创建并按 owner/refcount 管理，Omni adapter 安装兼容 group view。长期接口应是 model/runner-scoped communicator provider，彻底避免 Omni module-level group globals。
 
 ---
 
@@ -324,7 +327,7 @@ main()
   -> Worker ModelInstanceRegistry.get(generator_id)
   -> EmbeddedOmniDiffusionRunner.execute_model()
   -> preparing/denoising/VAE boundary
-  -> Engine ExecutionUnitScheduler chooses generator_full/shared
+  -> Engine ExecutionSliceScheduler chooses generator_full/shared
   -> Worker arbiter grants stream lease
   -> phase kernels enqueue
   -> completion event + lease.finish()
@@ -376,7 +379,7 @@ Engine registry 负责部署意图，Worker registry 保存 rank-local materiali
 | 请求入口 | `WorkerHostedRunnerClient.submit` | API 统一，执行域仍分支 |
 | 通信组 | `communicator_registry.py` | Engine spec、Worker materialization |
 | 动态分区 | `multi_model_arbiter.py` | full/shared 切换与 event 安全边界已验证 |
-| Diffusion units | `execution_units.py` | Engine Scheduler 已管理 unit 状态/mode |
+| Diffusion slices | `execution_slice_scheduler.py` | Engine Scheduler 已管理 slice 状态/mode |
 | Omni 适配 | `omni_runner_adapter.py` | phase/stream/memory/comm provider 已接入 |
 | Graph 变体 | `reasoner_graph_variants.py` + Worker hooks | shared/full 双变体已验证 |
 | 性能观测 | gate report + Worker startup/Graph counters | 实验完整，部分字段命名仍需去 primary 化 |
@@ -432,7 +435,7 @@ dead path 清理后，按下面顺序读即可覆盖当前活跃调用链：
 4. [`vllm/experimental/multi_model_gpu_worker.py`](../../../vllm/experimental/multi_model_gpu_worker.py#L194)：`MultiModelGPUWorker._create_model_runner()` 与 `_shutdown_model_runner()`
 5. [`vllm/experimental/multi_model_worker.py`](../../../vllm/experimental/multi_model_worker.py#L399)：`WorkerHostedRunnerClient.register/submit`
 6. [`vllm/experimental/multi_model_topology.py`](../../../vllm/experimental/multi_model_topology.py#L54) 与 [`vllm/experimental/communicator_registry.py`](../../../vllm/experimental/communicator_registry.py#L19)：`TopologyPlanner` 与 `CommunicatorRegistry`
-7. [`vllm/v1/core/sched/execution_units.py`](../../../vllm/v1/core/sched/execution_units.py#L73)：`ExecutionUnitScheduler`
+7. [`vllm/v1/core/sched/execution_slice_scheduler.py`](../../../vllm/v1/core/sched/execution_slice_scheduler.py#L73)：`ExecutionSliceScheduler`
 8. [`vllm/experimental/omni_runner_adapter.py`](../../../vllm/experimental/omni_runner_adapter.py#L147)：`EmbeddedOmniDiffusionRunner`，重点看 `configure_execution_unit_scheduler()` 与 `_await_execution_unit_admission()`；旧的本地 Condition admission gate 已删除
 9. [`vllm/experimental/multi_model_arbiter.py`](../../../vllm/experimental/multi_model_arbiter.py#L42)：`MultiModelResourceArbiter`，从 `acquire_generator_phase()`/`finish_generator_phase()` 阅读，不再经过旧 step-only alias
 10. [`vllm/experimental/reasoner_graph_variants.py`](../../../vllm/experimental/reasoner_graph_variants.py#L25)：`ModelGraphVariantManager`

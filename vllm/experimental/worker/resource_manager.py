@@ -8,6 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
+from vllm.experimental.communication import CommunicationGroupDescription
 from vllm.experimental.worker.binding import (
     CudaStreamBinding,
     DefaultMemoryBinding,
@@ -16,7 +17,6 @@ from vllm.experimental.worker.binding import (
     TaggedMemoryPoolBinding,
 )
 from vllm.experimental.worker.resource_desc import (
-    CommunicationGroupDescription,
     ExecutionVariantDescription,
     MemoryResourceDescription,
 )

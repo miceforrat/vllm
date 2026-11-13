@@ -16,9 +16,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping, Protocol
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from vllm.experimental.worker.resource_desc import (
-        CommunicationGroupDescription,
-    )
+    from vllm.experimental.communication import CommunicationGroupDescription
 
 
 class CommunicatorBinding(Protocol):

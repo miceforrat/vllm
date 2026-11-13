@@ -25,8 +25,7 @@ LLM / LLMEngine
 EngineCore
   |-- ModelRegistry                          Engine authoritative state
   |-- Scheduler
-  |    `-- ExecutionUnitScheduler             Diffusion execution-unit 状态机
-  |-- ExecutionUnitAdmissionServer            Worker boundary -> Engine Scheduler
+  |    `-- ExecutionSliceScheduler             跨模型 slice 资源变体选择
   `-- Executor                                原生 vLLM Executor
          |
          v
@@ -128,41 +127,41 @@ main()
 
 ---
 
-## 4. EngineCore/Scheduler：Diffusion execution units 已进入调度层
+## 4. EngineCore/Scheduler：Execution slices 已进入调度层
 
-### 4.1 状态机
+### 4.1 调度入口
 
-[`ExecutionUnitScheduler`](../../../vllm/v1/core/sched/execution_units.py#L73) 管理：
+[`ExecutionSliceScheduler`](../../../vllm/v1/core/sched/execution_slice_scheduler.py) 管理：
 
 ```text
-request
-  `-- execution unit 0..N
-        PENDING -> ADMITTED -> RUNNING -> COMPLETED/FAILED
+ExecutionSliceDescriptor + model demand
+  -> full/shared variant
+  -> ScheduledExecutionSlice
 ```
 
-每个 unit 携带 `kind/index/metadata`。当前 Cosmos3 暴露：
+每个 slice 携带 `sequence_no/tags/metadata`。当前 Cosmos3 暴露：
 
 - preparing；
 - 每个 denoising step；
 - VAE segments；
-- complete boundary。
+- VAE blocks。
 
-`primary_demand` 决定新 unit 选择 `shared` 还是 `generator_full`。
+其他模型是否存在 demand，决定新 slice 选择 `shared` 还是模型的 full variant。
 
-### 4.2 Worker 如何同步询问 Engine Scheduler
+### 4.2 EngineCore 如何主动推进 Worker
 
-动态模式下，[`EngineCore`](../../../vllm/v1/engine/core.py#L178) 创建 [`ExecutionUnitAdmissionServer`](../../../vllm/v1/core/sched/execution_units.py#L256)，通过 `collective_rpc("configure_execution_unit_scheduler", ...)` 把 endpoint 下发所有 Worker。
+动态模式下，EngineCore 取得 Worker 返回的下一 slice boundary，调用 `ExecutionSliceScheduler.schedule_slice()`，再通过 RPC 将 `ScheduledExecutionSlice` 主动下发 Worker。
 
-Omni pipeline 到达 phase boundary 时，由 adapter 发出 boundary 请求；Engine Scheduler 原子完成上一 unit、注册/准入/启动下一 unit，并返回 selected mode。这保留了单次 `DiffusionModelRunner.execute_model()`，没有把整个 Omni Runner 拆成外部逐 step RPC。
+旧 Worker 反向请求 Engine 的 socket admission 路径已归档。当前 Omni provider 显式推进一个 slice 后返回下一 boundary，不再需要本地 Server/Client。
 
 ### 4.3 当前 Scheduler 的边界
 
-它已经管理 execution-unit 生命周期和 mode decision，但还不是完整 ResourceScheduler：
+它已经管理 slice 的资源变体决策，但还不是完整 ResourceScheduler：
 
-- 决策规则仍只有“有 primary demand -> shared，否则 generator_full”；
+- 决策规则仍只有“存在其他模型 demand -> shared，否则 full”；
 - 不做多模型排队、公平性、优先级、deadline/SLO 或容量 admission；
-- 不直接拥有 CUDA stream/event；实际安全切换仍由 Worker arbiter 完成；
-- LLM batch scheduler 和 diffusion-unit scheduler 仍是相邻状态机，而非统一可调度实体队列。
+- 不直接拥有 CUDA stream/event；Worker 根据决策激活实际资源；
+- 尚未形成具有公平性和优先级的统一可调度实体队列。
 
 ---
 
@@ -203,7 +202,7 @@ backend 通过 `RunnerBackend` protocol 扩展。目前同时注册 `vllm -> Vll
 
 ### 6.3 `CommunicatorRegistry`
 
-[`CommunicatorRegistry`](../../../vllm/experimental/communicator_registry.py#L19) 根据 Engine 下发的 `CommunicationGroupSpec` 在每个 Worker/rank 物化通信组，并记录 owner/refcount。Omni backend 从 registry acquire，而不是从 Worker 反向读取 Engine 拓扑。
+`CommManager` 根据 Engine 下发的共享 `CommunicationGroupDescription` 在每个 Worker/rank 物化通信组，并记录 owner/refcount。Omni backend 从 Manager acquire，而不是从 Worker 反向读取 Engine 拓扑。
 
 当前只验证同构 TP；Omni module-level group compatibility view 仍由 adapter 临时安装。长期应让模型代码直接使用 runner-scoped communicator provider。
 
@@ -318,7 +317,7 @@ MultiModelEngine
 | Engine `ModelRegistry` | frontend mirror + EngineCore authoritative registry | 约 70% | 缺完整部署事务、失败回滚和持久状态机 |
 | `TopologyPlanner` | `multi_model_topology.py` | 约 65% | 仅同构 TP gate；缺 placement solver、rank 子集、PP/DP/异构拓扑 |
 | `UnifiedRequestRouter` | `submit(model_id, request)` | 约 60% | 仍是 frontend client 分支，不是 Engine 原生 router/queue |
-| `ResourceScheduler` | `ExecutionUnitScheduler` + Worker arbiter | 约 55% | 策略与 CUDA 安全机制分散；缺 N-model、公平性、SLO、统一队列 |
+| `ResourceScheduler` | `ExecutionSliceScheduler` + Worker arbiter | 约 55% | 策略与 CUDA 安全机制分散；缺 N-model、公平性、SLO、统一队列 |
 | Executor 接入 | 原生 Executor + collective RPC | 约 55% | 缺按 placement rank 子集部署/调用，多模型 plan 不是一等配置 |
 | `RunnerFactory` | `runner_factory.py` | 约 85% | vLLM/Omni 均经 Factory；销毁/provider 契约仍需进一步统一 |
 | `ModelInstanceRegistry` | `model_instance_registry.py` | 约 85% | Worker 内已统一；Engine registry 尚未对应 |

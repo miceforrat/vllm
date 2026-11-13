@@ -5,20 +5,17 @@ from typing import Any
 
 import pytest
 
-from vllm.experimental.model_instance_registry import (
-    CommunicationGroupSpec,
-    ModelSpec,
-)
+from vllm.experimental.communication import CommunicationGroupDescription
+from vllm.experimental.execution_slice import ExecutionSliceDescriptor
+from vllm.experimental.model_instance_registry import ModelSpec
 from vllm.experimental.worker.multi_model_worker import MultiModelWorker
-from vllm.experimental.worker.model_lifecycle import NativeGPUWorkerLifecycle
 from vllm.experimental.worker.resource_desc import (
-    CommunicationGroupDescription,
     ExecutionVariantDescription,
     MemoryResourceDescription,
     ResourceDescription,
     StreamResourceDescription,
 )
-from vllm.v1.core.sched.execution_units import ScheduledExecutionSlice
+from vllm.v1.core.sched.execution_slice_scheduler import ScheduledExecutionSlice
 
 
 def _bare_worker(
@@ -43,7 +40,7 @@ def _bare_worker(
 
 
 def test_startup_model_and_compatibility_resources() -> None:
-    group = CommunicationGroupSpec("reasoner-tp", "tp", (0, 1))
+    group = CommunicationGroupDescription("reasoner-tp", "tp", (0, 1))
     planned = ModelSpec(
         "reasoner",
         "model",
@@ -94,8 +91,17 @@ def test_worker_executes_engine_scheduled_slice() -> None:
     events: list[Any] = []
 
     class _Container:
-        def step(self, *, work: Any, variant_name: str) -> str:
-            events.append((work, variant_name))
+        def execute_slice(
+            self,
+            *,
+            descriptor: ExecutionSliceDescriptor,
+            work: Any,
+            variant_name: str,
+            request_id: str,
+        ) -> str:
+            events.append(
+                (descriptor.sequence_no, work, variant_name, request_id)
+            )
             return "done"
 
     class _Registry:
@@ -109,14 +115,13 @@ def test_worker_executes_engine_scheduled_slice() -> None:
     scheduled = ScheduledExecutionSlice(
         model_id="reasoner",
         request_id="batch-1",
-        kind="model_batch",
-        index=None,
+        descriptor=ExecutionSliceDescriptor(sequence_no=0),
         resource_variant="shared",
         execution_epoch=7,
     )
 
     assert worker.execute_slice(scheduled, work="batch") == "done"
-    assert events == [("batch", "shared")]
+    assert events == [(0, "batch", "shared", "batch-1")]
     assert worker._last_execution_epoch == 7
 
 
@@ -124,7 +129,7 @@ def test_native_warmup_without_scheduled_slice_uses_default_variant() -> None:
     events: list[Any] = []
 
     class _Container:
-        def step(self, *, work: Any, variant_name: str | None) -> str:
+        def execute_slice(self, *, work: Any, variant_name: str | None) -> str:
             events.append((work, variant_name))
             return "warmup"
 
@@ -196,69 +201,9 @@ def test_registry_selects_scheduler_managed_container() -> None:
     assert registry.require_scheduler_managed() is scheduler
 
 
-def test_vllm_lifecycle_wraps_native_dual_graph_compile(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[Any] = []
-    description = ResourceDescription(
-        memory=MemoryResourceDescription("default"),
-        execution_variants=(
-            ExecutionVariantDescription(
-                "shared",
-                StreamResourceDescription(
-                    "green_context", 34, "reasoner-generator"
-                ),
-                cuda_graph=True,
-            ),
-            ExecutionVariantDescription(
-                "reasoner_full",
-                StreamResourceDescription("dedicated"),
-                cuda_graph=True,
-            ),
-        ),
-        default_variant="reasoner_full",
-    )
-    runner = SimpleNamespace(graph_variant_capture_provider=None)
-
-    class _GraphManager:
-        def set_capture_handler(self, owner, actual_runner, handler) -> None:
-            events.append(("set", owner, actual_runner, handler.__name__))
-
-        def clear_capture_handler(self, owner) -> None:
-            events.append(("clear", owner))
-
-    class _Container:
-        model_id = "reasoner"
-        resource_description = description
-        exec_unit = SimpleNamespace(runner=runner)
-
-        def register_graph_manager(self) -> None:
-            events.append("register")
-
-    graph_manager = _GraphManager()
-    worker = _bare_worker()
-    container = _Container()
-
-    def compile_native(_worker: Any) -> str:
-        assert runner.graph_variant_capture_provider is graph_manager
-        events.append("compile")
-        return "compiled"
-
-    from vllm.v1.worker.gpu_worker import Worker as GPUWorker
-
-    monkeypatch.setattr(GPUWorker, "compile_or_warm_up_model", compile_native)
-    lifecycle = NativeGPUWorkerLifecycle(worker, container, graph_manager)
-
-    assert lifecycle.compile_or_warm_up_model() == "compiled"
-    assert events[0] == "register"
-    assert events[1][:3] == ("set", "reasoner", runner)
-    assert events[2:] == ["compile", ("clear", "reasoner")]
-    assert runner.graph_variant_capture_provider is None
-
-
 def test_atomic_startup_plan_restores_both_model_resources() -> None:
-    reasoner_group = CommunicationGroupSpec("reasoner-tp", "tp", (0, 1))
-    generator_group = CommunicationGroupSpec(
+    reasoner_group = CommunicationGroupDescription("reasoner-tp", "tp", (0, 1))
+    generator_group = CommunicationGroupDescription(
         "generator-tp", "tp", (0, 1)
     )
     reasoner_resource_group = CommunicationGroupDescription(

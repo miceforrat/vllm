@@ -6,10 +6,12 @@ from typing import Any
 import pytest
 
 from vllm.experimental.model_instance_registry import ModelSpec
+from vllm.experimental.execution_slice import (
+    ExecutionSliceDescriptor,
+)
 from vllm.experimental.worker.exec_unit import (
     LLMExecUnit,
     OmniModelExecUnit,
-    OmniStepResult,
 )
 
 
@@ -20,6 +22,11 @@ class _Runner:
     def execute_model(self, scheduler_output: Any) -> str:
         self.executed.append(scheduler_output)
         return f"result:{scheduler_output}"
+
+
+def _execute_next(unit: Any, request_id: str | None = None) -> Any:
+    descriptor = unit.next_slice_spec(request_id)
+    return unit.execute_slice(descriptor, request_id=request_id)
 
 
 def _create_unit(monkeypatch: pytest.MonkeyPatch) -> tuple[LLMExecUnit, _Runner]:
@@ -55,8 +62,8 @@ def test_llm_exec_unit_repeatedly_receives_and_advances_work(
     unit.recv_job("batch-1")
 
     assert unit.pending_work_count == 2
-    assert unit.step() == "result:batch-0"
-    assert unit.step() == "result:batch-1"
+    assert _execute_next(unit) == "result:batch-0"
+    assert _execute_next(unit) == "result:batch-1"
     assert unit.pending_work_count == 0
     assert runner.executed == ["batch-0", "batch-1"]
 
@@ -72,7 +79,7 @@ def test_llm_exec_unit_can_use_worker_batch_executor(
 
     unit.recv_job("batch")
 
-    assert unit.step() == "worker-result:batch"
+    assert _execute_next(unit) == "worker-result:batch"
     assert executed == ["batch"]
     assert runner.executed == []
 
@@ -84,7 +91,7 @@ def test_llm_exec_unit_rejects_invalid_work(
     with pytest.raises(ValueError, match="empty work"):
         unit.recv_job(None)
     with pytest.raises(RuntimeError, match="no runnable work"):
-        unit.step()
+        _execute_next(unit)
 
 
 class _OmniRunner:
@@ -92,34 +99,51 @@ class _OmniRunner:
         self.executed: list[Any] = []
         self.unit: OmniModelExecUnit | None = None
 
-    def prepare_explicit_request(self, request: Any) -> Any:
-        self.executed.append(request)
-        return _OmniState(request)
-
-    def execute_explicit_denoising_step(self, state: Any) -> Any:
-        state.step_index += 1
-        return state
-
-    def prepare_explicit_vae_blocks(self, state: Any) -> None:
-        state.extra["vae_block_index"] = 0
-
-    def execute_explicit_vae_block(self, state: Any) -> bool:
-        state.extra["vae_block_index"] += 1
-        return state.extra["vae_block_index"] >= 2
-
-    def finalize_explicit_vae_blocks(self, state: Any) -> str:
-        return f"omni-result:{state.request}"
+    def execute_stepwise(self, scheduler_output: Any) -> Any:
+        request_ids = tuple(scheduler_output.scheduled_request_ids)
+        self.executed.append(request_ids)
+        outputs = {
+            request_id: SimpleNamespace(request_id=request_id)
+            for request_id in request_ids
+        }
+        return SimpleNamespace(get_request_output=outputs.get)
 
 
-class _OmniState:
-    def __init__(self, request: Any) -> None:
-        self.request = request
-        self.step_index = 0
-        self.extra: dict[str, Any] = {}
+class _FakeStepScheduler:
+    def __init__(self) -> None:
+        self.progress: dict[str, int] = {}
+
+    def initialize(self, _config: Any) -> None:
+        pass
 
     @property
-    def denoise_completed(self) -> bool:
-        return self.step_index >= 2
+    def active_request_ids(self) -> tuple[str, ...]:
+        return tuple(self.progress)
+
+    def add_request(self, request: Any) -> str:
+        self.progress[request.request_id] = 0
+        return request.request_id
+
+    def execution_phase(self, request_id: str) -> tuple[str, int]:
+        cursor = self.progress[request_id]
+        return ("denoising" if cursor < 2 else "vae", max(cursor - 2, 0))
+
+    def schedule(self) -> Any:
+        request_ids = tuple(self.progress)
+        return SimpleNamespace(
+            scheduled_request_ids=request_ids,
+            is_empty=not request_ids,
+        )
+
+    def update_from_output(self, output: Any, _runner_output: Any) -> set[str]:
+        finished: set[str] = set()
+        for request_id in output.scheduled_request_ids:
+            self.progress[request_id] += 1
+            if self.progress[request_id] == 4:
+                finished.add(request_id)
+        for request_id in finished:
+            self.progress.pop(request_id)
+        return finished
 
 
 def _create_omni_unit(
@@ -148,6 +172,11 @@ def _create_omni_unit(
         OmniModelExecUnit,
         "_create_worker_hosted_runner",
         create_runner,
+    )
+    monkeypatch.setattr(
+        OmniModelExecUnit,
+        "_create_step_scheduler",
+        staticmethod(_FakeStepScheduler),
     )
     host_config = SimpleNamespace(name="host-config")
     unit = OmniModelExecUnit(
@@ -181,26 +210,22 @@ def test_omni_exec_unit_repeatedly_receives_and_advances_work(
 ) -> None:
     unit, runner = _create_omni_unit(monkeypatch)
 
-    unit.recv_job("request-0")
-    unit.recv_job("request-1")
+    unit.recv_job(SimpleNamespace(request_id="job-0"), request_id="job-0")
+    unit.recv_job(SimpleNamespace(request_id="job-1"), request_id="job-1")
     assert unit.pending_work_count == 2
 
-    expected_prefix = [
-        OmniStepResult("preparing", None, False),
-        OmniStepResult("denoising", 0, False),
-        OmniStepResult("denoising", 1, False),
+    results = [_execute_next(unit) for _ in range(4)]
+    assert [result.request_done for result in results] == [
+        False,
+        False,
+        False,
+        True,
     ]
-    assert [unit.step() for _ in range(3)] == expected_prefix
-    assert unit.step() == OmniStepResult("vae_blocks", 0, False)
-    assert unit.step() == OmniStepResult(
-        "vae_blocks", 1, True, "omni-result:request-0"
+    assert results[0].tags == frozenset(("diffusion", "denoising"))
+    assert results[2].tags == frozenset(
+        ("diffusion", "vae", "granularity:block")
     )
-    assert [unit.step() for _ in range(3)] == expected_prefix
-    assert unit.step() == OmniStepResult("vae_blocks", 0, False)
-    assert unit.step() == OmniStepResult(
-        "vae_blocks", 1, True, "omni-result:request-1"
-    )
-    assert runner.executed == ["request-0", "request-1"]
+    assert runner.executed == [("job-0", "job-1")] * 4
 
 
 def test_omni_exec_unit_rejects_invalid_backend_and_work(
@@ -216,5 +241,5 @@ def test_omni_exec_unit_rejects_invalid_backend_and_work(
     unit, _ = _create_omni_unit(monkeypatch)
     with pytest.raises(ValueError, match="empty work"):
         unit.recv_job(None)
-    with pytest.raises(RuntimeError, match="no runnable work"):
-        unit.step()
+    with pytest.raises(RuntimeError, match="no runnable requests"):
+        unit.execute_slice(ExecutionSliceDescriptor(0))
