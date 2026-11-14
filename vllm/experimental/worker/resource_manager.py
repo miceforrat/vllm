@@ -816,6 +816,11 @@ class GCCudaGraphManager:
             slot = self._models.get(key.owner_id)
             return slot is not None and key in slot.variants
 
+    def has_model(self, owner_id: str) -> bool:
+        """返回模型是否接入了原生 CUDA Graph manager。"""
+        with self._lock:
+            return str(owner_id) in self._models
+
     def active_variant(self, owner_id: str) -> GraphVariantKey | None:
         with self._lock:
             slot = self._require_model(owner_id)

@@ -97,6 +97,7 @@ def test_llm_exec_unit_rejects_invalid_work(
 class _OmniRunner:
     def __init__(self) -> None:
         self.executed: list[Any] = []
+        self.released: list[str] = []
         self.unit: OmniModelExecUnit | None = None
 
     def execute_stepwise(self, scheduler_output: Any) -> Any:
@@ -108,10 +109,14 @@ class _OmniRunner:
         }
         return SimpleNamespace(get_request_output=outputs.get)
 
+    def release_step_requests(self, request_ids: list[str]) -> None:
+        self.released.extend(request_ids)
+
 
 class _FakeStepScheduler:
     def __init__(self) -> None:
         self.progress: dict[str, int] = {}
+        self.terminal: dict[str, Any] = {}
 
     def initialize(self, _config: Any) -> None:
         pass
@@ -143,7 +148,24 @@ class _FakeStepScheduler:
                 finished.add(request_id)
         for request_id in finished:
             self.progress.pop(request_id)
+            self.terminal[request_id] = SimpleNamespace(
+                status=SimpleNamespace(name="FINISHED_COMPLETED"),
+                error=None,
+            )
         return finished
+
+    def pop_request_state(self, request_id: str) -> Any:
+        return self.terminal.pop(request_id, None)
+
+    def finish_requests(self, request_ids: list[str], status: Any) -> None:
+        for request_id in request_ids:
+            if request_id not in self.progress:
+                continue
+            self.progress.pop(request_id)
+            self.terminal[request_id] = SimpleNamespace(
+                status=status,
+                error=None,
+            )
 
 
 def _create_omni_unit(
@@ -226,6 +248,27 @@ def test_omni_exec_unit_repeatedly_receives_and_advances_work(
         ("diffusion", "vae", "granularity:block")
     )
     assert runner.executed == [("job-0", "job-1")] * 4
+    assert results[-1].metadata["terminal_requests"] == {
+        "job-0": {"status": "FINISHED_COMPLETED", "error": None},
+        "job-1": {"status": "FINISHED_COMPLETED", "error": None},
+    }
+
+
+def test_omni_exec_unit_abort_clears_scheduler_and_runner_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit, runner = _create_omni_unit(monkeypatch)
+    unit.recv_job(SimpleNamespace(request_id="job-0"), request_id="job-0")
+    unit.recv_job(SimpleNamespace(request_id="job-1"), request_id="job-1")
+
+    # 模拟 EngineCore 已取得下一片、但尚未下发执行时发生取消。
+    unit.next_slice_spec()
+    assert unit.abort_requests(("job-0",)) == ("job-0",)
+
+    assert unit.pending_work_count == 1
+    assert runner.released == ["job-0"]
+    descriptor = unit.next_slice_spec()
+    assert descriptor.metadata["request_ids"] == ("job-1",)
 
 
 def test_omni_exec_unit_rejects_invalid_backend_and_work(

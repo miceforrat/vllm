@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any
 
 from vllm.experimental.communication import CommunicationGroupDescription
@@ -32,6 +33,22 @@ from vllm.v1.core.sched.execution_slice_scheduler import ScheduledExecutionSlice
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 
+def _extract_media_tensor(runner_output: Any) -> Any | None:
+    """从 Omni 的终止输出中提取视频或图像张量。"""
+    result = getattr(runner_output, "result", runner_output)
+    media = getattr(result, "media", None)
+    if media is not None:
+        for name in ("video", "image"):
+            item = getattr(media, name, None)
+            tensor = getattr(item, "tensor", None)
+            if tensor is not None:
+                return tensor
+    output = getattr(result, "output", None)
+    if isinstance(output, dict):
+        output = output.get("video", output.get("image"))
+    return output if hasattr(output, "shape") else None
+
+
 class MultiModelWorker(GPUWorker):
     """统一拥有 ExecUnit、Container 与物理资源的 GPU Worker。
 
@@ -51,6 +68,68 @@ class MultiModelWorker(GPUWorker):
         self._model_jobs: dict[str, dict[str, Any]] = {}
         self._model_jobs_lock = threading.Lock()
         self._last_execution_epoch = 0
+        self._init_media_store()
+
+    def _init_media_store(self, max_items: int = 64) -> None:
+        """初始化 Worker 本地媒体仓；仓内张量保持原设备位置。"""
+        self._media_store: OrderedDict[str, Any] = OrderedDict()
+        self._media_lock = threading.Lock()
+        self._media_max_items = int(max_items)
+
+    def _put_media(self, request_id: str, tensor: Any) -> dict[str, Any]:
+        handle = f"media://{request_id}"
+        with self._media_lock:
+            self._media_store[handle] = tensor
+            self._media_store.move_to_end(handle)
+            while len(self._media_store) > self._media_max_items:
+                self._media_store.popitem(last=False)
+        return {
+            "handle": handle,
+            "shape": tuple(int(value) for value in tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(getattr(tensor, "device", "cpu")),
+        }
+
+    def fetch_media(
+        self, handle: str, release: bool = True
+    ) -> dict[str, Any] | None:
+        """按需把媒体拷贝到 CPU；未持有该句柄的 rank 返回 None。"""
+        with self._media_lock:
+            tensor = self._media_store.get(str(handle))
+        if tensor is None:
+            return None
+
+        start = time.perf_counter()
+        if hasattr(tensor, "detach"):
+            cpu = tensor.detach().to("cpu", non_blocking=False).contiguous()
+            byte_count = int(cpu.numel() * cpu.element_size())
+        else:
+            import numpy as np
+
+            cpu = np.ascontiguousarray(tensor)
+            byte_count = int(cpu.nbytes)
+        seconds = time.perf_counter() - start
+        if release:
+            self.release_media(handle)
+        return {
+            "handle": str(handle),
+            "tensor": cpu,
+            "d2h_seconds": seconds,
+            "bytes": byte_count,
+        }
+
+    def borrow_media(self, handle: str, stream: Any | None = None) -> Any:
+        """同进程零拷贝借用媒体张量。"""
+        with self._media_lock:
+            tensor = self._media_store[str(handle)]
+        if stream is not None and hasattr(tensor, "record_stream"):
+            tensor.record_stream(stream)
+        return tensor
+
+    def release_media(self, handle: str) -> bool:
+        """释放 Worker 本地媒体句柄。"""
+        with self._media_lock:
+            return self._media_store.pop(str(handle), None) is not None
 
     @property
     def container_registry(self) -> MiniContainerRegistry:
@@ -368,6 +447,7 @@ class MultiModelWorker(GPUWorker):
         job_id = uuid.uuid4().hex if job_id is None else str(job_id)
         if not job_id:
             raise ValueError("Model request job_id cannot be empty")
+        container = self._container_registry.get(model_id)
         with self._model_jobs_lock:
             if job_id in self._model_jobs:
                 raise ValueError(f"Model job {job_id!r} already exists")
@@ -375,14 +455,15 @@ class MultiModelWorker(GPUWorker):
                 state["model_id"] == model_id
                 for state in self._model_jobs.values()
             )
-        container = self._container_registry.get(model_id)
-        container.recv_job(work, request_id=job_id)
-        spec = (
-            None
-            if model_driver_active
-            else container.exec_unit.next_slice_spec(job_id)
-        )
-        with self._model_jobs_lock:
+            # 入队必须与 driver 存活性检查和 job 登记属于同一原子状态转换。
+            # 最终 wave 也会在同一把锁内重读 pending_work_count；因此新请求
+            # 要么加入现有 driver，要么在旧 driver 退出后取得首个 slice。
+            container.recv_job(work, request_id=job_id)
+            spec = (
+                None
+                if model_driver_active
+                else container.exec_unit.next_slice_spec(job_id)
+            )
             self._model_jobs[job_id] = {
                 "model_id": model_id,
                 "variant_name": variant_name,
@@ -403,27 +484,126 @@ class MultiModelWorker(GPUWorker):
         scheduled: ScheduledExecutionSlice | dict[str, Any],
     ) -> dict[str, Any]:
         """执行 EngineCore 下发的一个 slice，并报告下一个边界。"""
+        decision = ScheduledExecutionSlice.from_payload(scheduled)
+        wave_request_ids = tuple(
+            str(value)
+            for value in decision.descriptor.metadata.get("request_ids", ())
+        )
+        container = self._container_registry.get(decision.model_id)
         with self._model_jobs_lock:
             try:
                 state = self._model_jobs[job_id]
             except KeyError as exc:
                 raise KeyError(f"Unknown model job {job_id!r}") from exc
-            state["step_count"] += 1
-            if state["step_count"] > state["max_steps"]:
-                raise RuntimeError(
-                    f"Model request {job_id!r} exceeded "
-                    f"{state['max_steps']} execution slices"
+            counted_request_ids = wave_request_ids or (job_id,)
+            over_budget: list[str] = []
+            for request_id in counted_request_ids:
+                request_state = self._model_jobs.get(request_id)
+                if request_state is None:
+                    raise RuntimeError(
+                        f"Execution wave references unknown model job "
+                        f"{request_id!r}"
+                    )
+                if (
+                    request_state["step_count"] + 1
+                    > request_state["max_steps"]
+                ):
+                    over_budget.append(request_id)
+            if not over_budget:
+                for request_id in counted_request_ids:
+                    self._model_jobs[request_id]["step_count"] += 1
+            per_request_step_counts = {
+                request_id: self._model_jobs[request_id]["step_count"]
+                for request_id in counted_request_ids
+            }
+        if over_budget:
+            # 超限请求不进入本 wave；清理后把剩余请求的新边界交回 EngineCore，
+            # 让它重新做资源决策，避免一个请求的预算错误拖垮整个模型 driver。
+            container.exec_unit.abort_requests(tuple(over_budget))
+            now = time.perf_counter()
+            finished_seconds: dict[str, float] = {}
+            pending_work = container.exec_unit.pending_work_count
+            with self._model_jobs_lock:
+                for request_id in over_budget:
+                    finished_state = self._model_jobs.get(request_id)
+                    if finished_state is not None:
+                        finished_seconds[request_id] = (
+                            now - finished_state["started"]
+                        )
+                    if request_id != job_id or pending_work == 0:
+                        self._model_jobs.pop(request_id, None)
+            response: dict[str, Any] = {
+                "job_id": job_id,
+                "model_id": state["model_id"],
+                "rank": self.rank,
+                "request_done": pending_work == 0,
+                "finished_request_ids": tuple(over_budget),
+                "sequence_no": decision.descriptor.sequence_no,
+                "tags": sorted(decision.descriptor.tags),
+                "metadata": {
+                    "finished_request_ids": tuple(over_budget),
+                    "terminal_requests": {
+                        request_id: {
+                            "status": "FINISHED_ERROR",
+                            "error": (
+                                f"Model request {request_id!r} exceeded "
+                                "its execution-slice budget"
+                            ),
+                        }
+                        for request_id in over_budget
+                    },
+                },
+                "step_count": state["step_count"],
+                "per_request_step_counts": per_request_step_counts,
+                "finished_seconds": finished_seconds,
+            }
+            if pending_work:
+                response["next_slice"] = (
+                    container.exec_unit.next_slice_spec().to_payload()
                 )
+            return response
 
-        decision = ScheduledExecutionSlice.from_payload(scheduled)
-        container = self._container_registry.get(state["model_id"])
         result = self.execute_slice(decision)
-        model_idle = bool(container._result_field(result, "request_done"))
+        outputs = dict(container._result_field(result, "output") or {})
+        reported_idle = bool(container._result_field(result, "request_done"))
         result_metadata = dict(container._result_field(result, "metadata"))
         finished_request_ids = tuple(
             str(value)
             for value in result_metadata.get("finished_request_ids", ())
         )
+        # 等待最终 wave 的 GPU 工作后再发布模型空闲；等待期间到达的新请求
+        # 会先登记，随后在锁内复查时使当前 driver 继续运行。
+        if reported_idle:
+            assignment = container.assignment(decision.resource_variant)
+            import torch
+
+            completion = torch.cuda.Event()
+            completion.record(assignment.streams.stream)
+            completion.synchronize()
+
+        finished_seconds: dict[str, float] = {}
+        with self._model_jobs_lock:
+            model_idle = (
+                reported_idle
+                and container.exec_unit.pending_work_count == 0
+            )
+            for finished_request_id in finished_request_ids:
+                # 驱动请求的 job 记录在整个 model-level batch loop 中保留；
+                # 否则它先完成后，后续 wave 将失去计数和模型归属。
+                finished_state = self._model_jobs.get(finished_request_id)
+                if finished_state is not None:
+                    finished_seconds[finished_request_id] = (
+                        time.perf_counter() - finished_state["started"]
+                    )
+                if finished_request_id != job_id or model_idle:
+                    self._model_jobs.pop(finished_request_id, None)
+            if model_idle:
+                for active_job_id, active_state in tuple(
+                    self._model_jobs.items()
+                ):
+                    if active_state["model_id"] == state["model_id"]:
+                        self._model_jobs.pop(active_job_id, None)
+
         response = {
             "job_id": job_id,
             "model_id": state["model_id"],
@@ -434,38 +614,75 @@ class MultiModelWorker(GPUWorker):
             "tags": sorted(container._result_field(result, "tags")),
             "metadata": result_metadata,
             "step_count": state["step_count"],
+            "per_request_step_counts": per_request_step_counts,
         }
+        finished_media: dict[str, dict[str, Any]] = {}
         for finished_request_id in finished_request_ids:
-            # 驱动请求的 job 记录在整个 model-level batch loop 中保留；否则它
-            # 自己较早完成后，后续 wave 将失去计数和模型归属。
-            if finished_request_id == job_id and not model_idle:
-                continue
-            with self._model_jobs_lock:
-                finished_state = self._model_jobs.pop(
-                    finished_request_id, None
+            tensor = _extract_media_tensor(outputs.get(finished_request_id))
+            if tensor is not None:
+                finished_media[finished_request_id] = self._put_media(
+                    finished_request_id, tensor
                 )
-            if finished_state is not None:
-                response.setdefault("finished_seconds", {})[
-                    finished_request_id
-                ] = time.perf_counter() - finished_state["started"]
+        if finished_media:
+            response["finished_media"] = finished_media
+        if finished_seconds:
+            response["finished_seconds"] = finished_seconds
         if model_idle:
-            assignment = container.assignment(decision.resource_variant)
-            import torch
-
-            completion = torch.cuda.Event()
-            completion.record(assignment.streams.stream)
-            completion.synchronize()
             response["seconds"] = time.perf_counter() - state["started"]
-            with self._model_jobs_lock:
-                for active_job_id, active_state in tuple(
-                    self._model_jobs.items()
-                ):
-                    if active_state["model_id"] == state["model_id"]:
-                        self._model_jobs.pop(active_job_id, None)
         else:
             spec = container.exec_unit.next_slice_spec()
             response["next_slice"] = spec.to_payload()
         return response
+
+    def abort_model_request(
+        self, model_id: str, request_id: str
+    ) -> dict[str, Any]:
+        """等待当前 slice 结束，然后清理一个 Container 请求。"""
+        model_id = str(model_id)
+        request_id = str(request_id)
+        container = self._container_registry.get(model_id)
+        aborted = container.exec_unit.abort_requests((request_id,))
+        pending_work = container.exec_unit.pending_work_count
+        with self._model_jobs_lock:
+            state = self._model_jobs.get(request_id)
+            if state is not None and state["model_id"] != model_id:
+                raise RuntimeError(
+                    f"Model job {request_id!r} belongs to "
+                    f"{state['model_id']!r}, not {model_id!r}"
+                )
+            # model-level driver 仍以首个 job_id 推进同模型 batch。若还有其他
+            # 请求，保留这个记录作为 driver shell，最终 idle 时统一回收。
+            if pending_work == 0:
+                self._model_jobs.pop(request_id, None)
+        return {
+            "model_id": model_id,
+            "request_id": request_id,
+            "rank": self.rank,
+            "aborted": request_id in aborted,
+            "stopped": request_id in aborted or state is None,
+            "pending_work": pending_work,
+        }
+
+    def reset_model_requests(self, model_id: str) -> dict[str, Any]:
+        """模型 driver 异常后清空该模型的全部请求状态。"""
+        model_id = str(model_id)
+        container = self._container_registry.get(model_id)
+        with self._model_jobs_lock:
+            request_ids = tuple(
+                request_id
+                for request_id, state in self._model_jobs.items()
+                if state["model_id"] == model_id
+            )
+        stopped = container.exec_unit.abort_requests(request_ids)
+        with self._model_jobs_lock:
+            for request_id in request_ids:
+                self._model_jobs.pop(request_id, None)
+        return {
+            "model_id": model_id,
+            "rank": self.rank,
+            "stopped_request_ids": stopped,
+            "pending_work": container.exec_unit.pending_work_count,
+        }
 
     def unregister_model(self, model_id: str) -> dict[str, Any]:
         """销毁运行时模型，并释放其 Container 资源。"""
@@ -501,22 +718,37 @@ class MultiModelWorker(GPUWorker):
             if model_id is None
             else self._container_registry.get(model_id)
         )
-        active = self._graph_manager.active_variant(container.model_id)
+        graph_registered = self._graph_manager.has_model(container.model_id)
+        active = (
+            self._graph_manager.active_variant(container.model_id)
+            if graph_registered
+            else None
+        )
         variant_step_counts = {
             f"{item.model_id}:{variant}": count
             for item in self._container_registry.all()
             for variant, count in item.variant_step_counts().items()
         }
+        with self._model_jobs_lock:
+            model_job_ids = tuple(
+                job_id
+                for job_id, state in self._model_jobs.items()
+                if state["model_id"] == container.model_id
+            )
         return {
             "rank": self.rank,
             "model_id": container.model_id,
             "active_graph_variant": (
                 None if active is None else active.variant_name
             ),
-            "capture_counts": self._graph_manager.counts(
-                container.model_id
+            "capture_counts": (
+                self._graph_manager.counts(container.model_id)
+                if graph_registered
+                else {}
             ),
             "variant_step_counts": variant_step_counts,
+            "pending_work": container.exec_unit.pending_work_count,
+            "model_job_ids": model_job_ids,
         }
 
     def execute_model(self, scheduler_output: Any):

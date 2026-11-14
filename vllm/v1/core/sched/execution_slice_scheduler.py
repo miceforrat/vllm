@@ -108,6 +108,27 @@ class ExecutionSliceScheduler:
             self._revision += 1
             return self.snapshot()
 
+    def validate_requested_variant(
+        self, model_id: str, requested_variant: str | None
+    ) -> None:
+        """在请求进入 Worker 前校验显式资源变体。"""
+        if requested_variant in (None, "auto"):
+            return
+        with self._lock:
+            model_id = str(model_id)
+            full_variant, shared_variant = self._model_variants.get(
+                model_id, ("generator_full", "shared")
+            )
+            allowed = {full_variant}
+            if shared_variant is not None:
+                allowed.add(shared_variant)
+            if str(requested_variant) not in allowed:
+                raise ValueError(
+                    f"Unknown resource variant {requested_variant!r} for "
+                    f"model {model_id!r}; expected one of "
+                    f"{sorted(allowed)!r} or 'auto'"
+                )
+
     def schedule_slice(
         self,
         model_id: str,
@@ -136,12 +157,7 @@ class ExecutionSliceScheduler:
             requested = descriptor.metadata.get("requested_variant")
             if requested not in (None, "auto"):
                 requested = str(requested)
-                allowed = {full_variant, shared_variant}
-                if requested not in allowed:
-                    raise ValueError(
-                        f"Unknown resource variant {requested!r} for "
-                        f"model {model_id!r}"
-                    )
+                self.validate_requested_variant(model_id, requested)
                 variant = requested
             self._next_execution_epoch += 1
             return ScheduledExecutionSlice(

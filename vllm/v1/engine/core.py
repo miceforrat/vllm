@@ -134,6 +134,7 @@ class EngineCore:
         self.model_registry = create_engine_core_model_registry(vllm_config)
         self._model_request_sessions: dict[str, str] = {}
         self._model_request_futures: dict[str, Future[list[Any]]] = {}
+        self._model_request_variants: dict[str, str] = {}
         # Session 生命周期由 Frontend 最终回收；执行 demand 则必须在模型完成
         # 最后一个 GPU slice 时立即释放，否则一个尚未被消费的 Handle 会让
         # 其他模型继续误判为资源竞争状态。
@@ -141,6 +142,7 @@ class EngineCore:
         self._model_request_demand_lock = threading.RLock()
         self._model_request_driver_futures: dict[str, Future[Any]] = {}
         self._model_request_driver_lock = threading.RLock()
+        self._aborted_model_requests: set[str] = set()
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -1155,6 +1157,18 @@ class EngineCore:
         """按模型推进 scheduler wave，并将 batch 完成结果拆给各请求。"""
         workers = first_workers
         while True:
+            with self._model_request_driver_lock:
+                driver_aborted = request_id in self._aborted_model_requests
+            if driver_aborted:
+                with self._model_request_demand_lock:
+                    another_request_active = any(
+                        active_id != request_id
+                        and self._model_request_sessions.get(active_id)
+                        == model_id
+                        for active_id in self._model_request_demand
+                    )
+                if not another_request_active:
+                    return workers
             boundaries = [worker.get("next_slice") for worker in workers]
             if not boundaries or any(boundary is None for boundary in boundaries):
                 raise RuntimeError(
@@ -1167,6 +1181,27 @@ class EngineCore:
                 )
             boundary = boundaries[0]
             assert isinstance(boundary, dict)
+            boundary_metadata = dict(boundary.get("metadata", {}))
+            wave_request_ids = tuple(
+                str(value)
+                for value in boundary_metadata.get("request_ids", ())
+            )
+            wave_variants = {
+                self._model_request_variants.get(value, "auto")
+                for value in wave_request_ids
+            }
+            explicit_variants = wave_variants - {"auto"}
+            if len(explicit_variants) > 1:
+                raise RuntimeError(
+                    "One execution wave contains conflicting resource "
+                    f"variants: {sorted(explicit_variants)!r} for "
+                    f"requests {wave_request_ids!r}"
+                )
+            wave_variant = (
+                next(iter(explicit_variants))
+                if explicit_variants
+                else "auto"
+            )
             scheduled = self.scheduler.execution_slices.schedule_slice(
                 model_id,
                 request_id,
@@ -1175,8 +1210,12 @@ class EngineCore:
                         boundary
                     ).sequence_no,
                     metadata={
-                        **dict(boundary.get("metadata", {})),
-                        "requested_variant": requested_variant,
+                        **boundary_metadata,
+                        "requested_variant": (
+                            wave_variant
+                            if wave_request_ids
+                            else requested_variant
+                        ),
                     },
                     tags=frozenset(
                         str(tag) for tag in boundary.get("tags", ())
@@ -1193,6 +1232,11 @@ class EngineCore:
             )
             if not finished_ids and bool(workers[0].get("request_done")):
                 finished_ids = (request_id,)
+            terminal_requests = dict(
+                workers[0].get("metadata", {}).get(
+                    "terminal_requests", {}
+                )
+            )
             for finished_id in finished_ids:
                 # Worker 已在最终 slice 的 stream 上记录并等待 completion
                 # event；此处即可恢复其他模型的 full variant，无需等待
@@ -1200,7 +1244,57 @@ class EngineCore:
                 self._release_model_request_demand(finished_id)
                 future = self._model_request_futures.get(finished_id)
                 if future is not None and not future.done():
-                    future.set_result(workers)
+                    terminal = terminal_requests.get(finished_id)
+                    status = (
+                        None if terminal is None else terminal.get("status")
+                    )
+                    error = (
+                        None if terminal is None else terminal.get("error")
+                    )
+                    if terminal is not None and (
+                        status != "FINISHED_COMPLETED" or error is not None
+                    ):
+                        detail = error or status or "unknown terminal error"
+                        future.set_exception(
+                            RuntimeError(
+                                f"Model request {finished_id!r} failed "
+                                f"({status or 'UNKNOWN'}): {detail}"
+                            )
+                        )
+                    else:
+                        request_workers: list[dict[str, Any]] = []
+                        for worker in workers:
+                            request_worker = dict(worker)
+                            finished_seconds = dict(
+                                worker.get("finished_seconds", {})
+                            )
+                            per_request_steps = dict(
+                                worker.get("per_request_step_counts", {})
+                            )
+                            finished_media = dict(
+                                worker.get("finished_media", {})
+                            )
+                            if finished_id in finished_seconds:
+                                request_worker["seconds"] = (
+                                    finished_seconds[finished_id]
+                                )
+                            if finished_id in per_request_steps:
+                                request_worker["step_count"] = (
+                                    per_request_steps[finished_id]
+                                )
+                            if finished_id in finished_media:
+                                request_worker["media"] = finished_media[
+                                    finished_id
+                                ]
+                            if terminal is not None:
+                                request_worker["status"] = terminal.get(
+                                    "status"
+                                )
+                                request_worker["error"] = terminal.get(
+                                    "error"
+                                )
+                            request_workers.append(request_worker)
+                        future.set_result(request_workers)
             done = [bool(worker.get("request_done")) for worker in workers]
             if any(value != done[0] for value in done[1:]):
                 raise RuntimeError(
@@ -1263,8 +1357,12 @@ class EngineCore:
             raise ValueError(
                 f"Unknown model request options: {sorted(values)!r}"
             )
+        self.scheduler.execution_slices.validate_requested_variant(
+            spec.model_id, variant
+        )
         request_future: Future[list[Any]] = Future()
         self._model_request_futures[request_id] = request_future
+        self._model_request_variants[request_id] = variant
         try:
             workers = self.model_executor.collective_rpc(
                 "start_model_request",
@@ -1272,9 +1370,11 @@ class EngineCore:
             )
         except Exception:
             self._model_request_futures.pop(request_id, None)
+            self._model_request_variants.pop(request_id, None)
             raise
         if not workers:
             self._model_request_futures.pop(request_id, None)
+            self._model_request_variants.pop(request_id, None)
             raise RuntimeError(
                 f"No Worker accepted model request {request_id!r}"
             )
@@ -1301,9 +1401,20 @@ class EngineCore:
                 self._model_request_driver_futures[spec.model_id] = driver
 
                 def propagate_driver_failure(done: Future[Any]) -> None:
+                    with self._model_request_driver_lock:
+                        self._aborted_model_requests.discard(request_id)
                     error = done.exception()
                     if error is None:
                         return
+                    try:
+                        self.model_executor.collective_rpc(
+                            "reset_model_requests", args=(spec.model_id,)
+                        )
+                    except Exception as reset_error:
+                        error = RuntimeError(
+                            f"Model driver for {spec.model_id!r} failed: "
+                            f"{error}; Worker reset also failed: {reset_error}"
+                        )
                     for pending_id, pending in tuple(
                         self._model_request_futures.items()
                     ):
@@ -1312,6 +1423,7 @@ class EngineCore:
                             == spec.model_id
                             and not pending.done()
                         ):
+                            self._release_model_request_demand(pending_id)
                             pending.set_exception(error)
 
                 driver.add_done_callback(propagate_driver_failure)
@@ -1335,12 +1447,33 @@ class EngineCore:
             raise RuntimeError(
                 f"Model request {request_id!r} belongs to {owner!r}"
             )
+        request_future = self._model_request_futures.get(request_id)
+        if (
+            spec.backend != "vllm"
+            and request_future is not None
+            and not request_future.done()
+        ):
+            # 先阻止 model driver 提交下一片，再等待 Worker 排空当前片并清理
+            # scheduler/Runner 状态。只有 Worker 确认停止后才能释放 demand。
+            with self._model_request_driver_lock:
+                self._aborted_model_requests.add(request_id)
+            workers = self.model_executor.collective_rpc(
+                "abort_model_request", args=(spec.model_id, request_id)
+            )
+            if any(not worker.get("stopped", False) for worker in workers):
+                raise RuntimeError(
+                    f"Workers failed to abort model request {request_id!r}: "
+                    f"{workers!r}"
+                )
+            request_future.cancel()
+
         # 原生 vLLM 请求没有 Container driver 的最终 slice 回调，因此在
         # Frontend 输出流结束时释放；Container 请求在这里通常已经释放，
         # 幂等 helper 不会重复递减。
         self._release_model_request_demand(request_id)
         self._model_request_sessions.pop(request_id, None)
         self._model_request_futures.pop(request_id, None)
+        self._model_request_variants.pop(request_id, None)
         model_still_active = any(
             session_model_id == spec.model_id
             for active_request_id, session_model_id in

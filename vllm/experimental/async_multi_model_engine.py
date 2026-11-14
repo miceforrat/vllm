@@ -200,14 +200,12 @@ class AsyncMultiModelEngine(AsyncLLM):
         if context is None:
             await super()._dispatch_prepared_request(request)
             return
-        model_id, request_id = context
-        await self.execution_unit_rpc(
-            "submit_model_request",
-            model_id,
-            request_id,
-            request,
-            {},
-        )
+        # 原生 vLLM 请求必须使用 EngineCoreClient 的强类型请求通道。经通用
+        # utility RPC 的 ``Any`` 参数传输时，msgspec 会把 EngineCoreRequest
+        # 还原成普通映射，Core 无法再执行原生 Scheduler 预处理。模型 session
+        # 与 demand 已在 submit() 开头登记，因此这里直接复用 AsyncLLM 的
+        # 标准 EngineCore 提交通道即可。
+        await self.engine_core.add_request_async(request)
 
     async def _run_vllm_preprocessor(
         self,

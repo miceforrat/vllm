@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+import threading
+import time
 from typing import Any
 
+import numpy as np
 import pytest
 
 from vllm.experimental.communication import CommunicationGroupDescription
@@ -25,6 +28,7 @@ def _bare_worker(
     resources: dict[str, Any] | None = None,
 ) -> MultiModelWorker:
     worker = MultiModelWorker.__new__(MultiModelWorker)
+    worker._last_execution_epoch = 0
     if specs is None:
         specs = () if spec is None else (spec,)
     payloads = [item.to_rpc_payload() for item in specs]
@@ -37,6 +41,26 @@ def _bare_worker(
         }
     )
     return worker
+
+
+def test_worker_media_handle_fetch_and_release() -> None:
+    worker = _bare_worker()
+    worker._init_media_store()
+    media = np.arange(12, dtype=np.float32).reshape(1, 3, 2, 2)
+
+    descriptor = worker._put_media("request-a", media)
+
+    assert descriptor == {
+        "handle": "media://request-a",
+        "shape": (1, 3, 2, 2),
+        "dtype": "float32",
+        "device": "cpu",
+    }
+    fetched = worker.fetch_media(descriptor["handle"], release=True)
+    assert fetched is not None
+    np.testing.assert_array_equal(fetched["tensor"], media)
+    assert fetched["bytes"] == media.nbytes
+    assert worker.fetch_media(descriptor["handle"]) is None
 
 
 def test_startup_model_and_compatibility_resources() -> None:
@@ -351,3 +375,131 @@ def test_runtime_registration_rejects_partial_green_partition() -> None:
         worker.register_model(
             spec.to_rpc_payload(), description.to_rpc_payload()
         )
+
+
+def test_model_request_slice_counts_each_wave_request_independently() -> None:
+    class _Unit:
+        pending_work_count = 2
+
+        def next_slice_spec(self) -> ExecutionSliceDescriptor:
+            return ExecutionSliceDescriptor(
+                1, metadata={"request_ids": ("B",)}
+            )
+
+    class _Container:
+        exec_unit = _Unit()
+
+        @staticmethod
+        def execute_slice(**_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                request_done=False,
+                sequence_no=0,
+                tags=frozenset(("diffusion",)),
+                metadata={"finished_request_ids": ("A",)},
+            )
+
+        @staticmethod
+        def _result_field(result: Any, name: str) -> Any:
+            return getattr(result, name)
+
+    worker = _bare_worker()
+    worker.rank = 0
+    worker._model_jobs_lock = threading.Lock()
+    started = time.perf_counter()
+    worker._model_jobs = {
+        "A": {
+            "model_id": "generator",
+            "variant_name": "full",
+            "max_steps": 2,
+            "step_count": 0,
+            "started": started,
+        },
+        "B": {
+            "model_id": "generator",
+            "variant_name": "full",
+            "max_steps": 2,
+            "step_count": 0,
+            "started": started,
+        },
+    }
+    worker._container_registry = SimpleNamespace(
+        get=lambda _model_id: _Container()
+    )
+    scheduled = ScheduledExecutionSlice(
+        model_id="generator",
+        request_id="A",
+        descriptor=ExecutionSliceDescriptor(
+            0, metadata={"request_ids": ("A", "B")}
+        ),
+        resource_variant="full",
+        execution_epoch=1,
+    )
+
+    result = worker.execute_model_request_slice("A", scheduled)
+
+    assert result["per_request_step_counts"] == {"A": 1, "B": 1}
+    assert result["finished_seconds"]["A"] >= 0
+    assert worker._model_jobs["A"]["step_count"] == 1
+    assert worker._model_jobs["B"]["step_count"] == 1
+
+
+def test_over_budget_request_does_not_fail_other_wave_requests() -> None:
+    class _Unit:
+        pending_work_count = 1
+        aborted: tuple[str, ...] = ()
+
+        def abort_requests(self, request_ids: tuple[str, ...]) -> tuple[str, ...]:
+            self.aborted = request_ids
+            return request_ids
+
+        def next_slice_spec(self) -> ExecutionSliceDescriptor:
+            return ExecutionSliceDescriptor(
+                0, metadata={"request_ids": ("B",)}
+            )
+
+    unit = _Unit()
+    container = SimpleNamespace(exec_unit=unit)
+    worker = _bare_worker()
+    worker.rank = 0
+    worker._model_jobs_lock = threading.Lock()
+    started = time.perf_counter()
+    worker._model_jobs = {
+        "A": {
+            "model_id": "generator",
+            "variant_name": "full",
+            "max_steps": 0,
+            "step_count": 0,
+            "started": started,
+        },
+        "B": {
+            "model_id": "generator",
+            "variant_name": "full",
+            "max_steps": 2,
+            "step_count": 0,
+            "started": started,
+        },
+    }
+    worker._container_registry = SimpleNamespace(
+        get=lambda _model_id: container
+    )
+    scheduled = ScheduledExecutionSlice(
+        model_id="generator",
+        request_id="A",
+        descriptor=ExecutionSliceDescriptor(
+            0, metadata={"request_ids": ("A", "B")}
+        ),
+        resource_variant="full",
+        execution_epoch=1,
+    )
+
+    result = worker.execute_model_request_slice("A", scheduled)
+
+    assert unit.aborted == ("A",)
+    assert result["request_done"] is False
+    assert result["finished_request_ids"] == ("A",)
+    assert result["next_slice"]["metadata"]["request_ids"] == ("B",)
+    assert result["metadata"]["terminal_requests"]["A"][
+        "status"
+    ] == "FINISHED_ERROR"
+    # A 导致旧 wave 被撤销；B 尚未执行，将在 next_slice 中重新调度。
+    assert worker._model_jobs["B"]["step_count"] == 0

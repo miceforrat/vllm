@@ -58,6 +58,12 @@ class MiniContainer:
         self._runtime_added = runtime_added
         self._variant_step_counts: Counter[str] = Counter()
         self._active_assignment: ResourceAssignment | None = None
+        # 相邻 slice 可能使用不同的执行 stream。用双槽 event 链记录本模型
+        # 最近一次 GPU 提交的完成边界，避免资源变体切换越过此前同一 stream
+        # 上连续提交、但尚未完成的 slice。
+        self._completion_events: tuple[Any, Any] | None = None
+        self._completion_event_index = 0
+        self._last_done_event: Any | None = None
         self._require_graph = True
         self._closed = False
         self._lock = threading.RLock()
@@ -312,14 +318,37 @@ class MiniContainer:
             with self._exec_unit.activate(
                 selected, resource_transition=resource_transition
             ):
-                result = self._exec_unit.execute_slice(
-                    selected_descriptor,
-                    request_id=request_id,
-                )
+                execution_stream = selected.streams.stream
+                if self._last_done_event is not None:
+                    execution_stream.wait_event(self._last_done_event)
+                try:
+                    result = self._exec_unit.execute_slice(
+                        selected_descriptor,
+                        request_id=request_id,
+                    )
+                finally:
+                    # Event 必须在实际执行 stream 上、所有本 slice GPU 工作
+                    # 提交之后记录。即使执行抛错，也要保护已经提交的工作。
+                    completion = self._next_completion_event()
+                    completion.record(execution_stream)
+                    self._last_done_event = completion
             self._active_assignment = selected
             name = "default" if selected_name is None else selected_name
             self._variant_step_counts[name] += 1
             return result
+
+    def _next_completion_event(self) -> Any:
+        """返回可复用的 completion event，避免每个 slice 创建新 Event。"""
+        if self._completion_events is None:
+            import torch
+
+            self._completion_events = (
+                torch.cuda.Event(enable_timing=False),
+                torch.cuda.Event(enable_timing=False),
+            )
+        event = self._completion_events[self._completion_event_index]
+        self._completion_event_index ^= 1
+        return event
 
     def variant_step_counts(self) -> dict[str, int]:
         """返回该模型各资源变体的实际执行次数。"""

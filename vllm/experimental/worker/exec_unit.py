@@ -115,6 +115,13 @@ class ExecUnit(ABC, Generic[_WorkT, _ResultT]):
         del request_id
         return ExecutionSliceDescriptor(0)
 
+    def abort_requests(self, request_ids: tuple[str, ...]) -> tuple[str, ...]:
+        """终止由该模型实例持有的请求，并返回实际清理的请求 ID。"""
+        raise NotImplementedError(
+            f"ExecUnit {self.model_id!r} does not support request abort: "
+            f"{request_ids!r}"
+        )
+
     def bind_resources(
         self,
         assignment: ResourceAssignment,
@@ -776,6 +783,40 @@ class OmniModelExecUnit(ExecUnit[Any, Any]):
                 request.request_id = session_id
             self._step_scheduler.add_request(request)
 
+    def abort_requests(self, request_ids: tuple[str, ...]) -> tuple[str, ...]:
+        """在当前 slice 排空后清理 scheduler 与 Runner 的请求状态。"""
+        from vllm_omni.diffusion.sched.interface import (
+            DiffusionRequestStatus,
+        )
+
+        requested = tuple(dict.fromkeys(str(value) for value in request_ids))
+        with self._step_lock:
+            with self._work_lock:
+                active = tuple(
+                    request_id
+                    for request_id in requested
+                    if request_id in self._step_scheduler.active_request_ids
+                )
+                if not active:
+                    return requested
+                pending = self._pending_scheduler_output
+                if pending is not None and any(
+                    request_id in pending.scheduled_request_ids
+                    for request_id in active
+                ):
+                    # 该 batch 尚未执行；丢弃后由 scheduler 为剩余请求重排。
+                    self._pending_scheduler_output = None
+                self._step_scheduler.finish_requests(
+                    list(active), DiffusionRequestStatus.FINISHED_ABORTED
+                )
+                for request_id in active:
+                    self._step_scheduler.pop_request_state(request_id)
+            # Runner 持有 latents/cache/step metadata，必须与 scheduler 一并清理。
+            release = getattr(self.runner, "release_step_requests", None)
+            if release is not None:
+                release(list(active))
+            return requested
+
     def next_slice_spec(
         self, request_id: str | None = None
     ) -> ExecutionSliceDescriptor:
@@ -843,10 +884,27 @@ class OmniModelExecUnit(ExecUnit[Any, Any]):
                 # pop_request_state()。Worker-hosted 路径没有那层 result
                 # pump，因此必须在这里完成同样的 scheduler 回收；否则状态
                 # 虽已 FINISHED，却会被误判成仍有下一段工作。
+                terminal_requests: dict[str, dict[str, str | None]] = {}
                 for finished_request_id in finished:
-                    self._step_scheduler.pop_request_state(
+                    terminal_state = self._step_scheduler.pop_request_state(
                         finished_request_id
                     )
+                    if terminal_state is None:
+                        terminal_requests[finished_request_id] = {
+                            "status": None,
+                            "error": "Scheduler lost terminal request state",
+                        }
+                        continue
+                    status = getattr(terminal_state, "status", None)
+                    status_name = getattr(status, "name", None)
+                    terminal_requests[finished_request_id] = {
+                        "status": (
+                            str(status_name)
+                            if status_name is not None
+                            else str(status)
+                        ),
+                        "error": getattr(terminal_state, "error", None),
+                    }
                 self._slice_sequence += 1
                 all_done = not self._step_scheduler.active_request_ids
             outputs = {
@@ -863,6 +921,7 @@ class OmniModelExecUnit(ExecUnit[Any, Any]):
                         scheduler_output.scheduled_request_ids
                     ),
                     "finished_request_ids": tuple(sorted(finished)),
+                    "terminal_requests": terminal_requests,
                 },
             )
 
