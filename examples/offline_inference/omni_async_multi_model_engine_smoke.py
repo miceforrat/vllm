@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--concurrent-repeats", type=int, default=5)
     parser.add_argument(
+        "--reasoner-fixed-tokens",
+        action="store_true",
+        help="Ignore EOS and force Reasoner generation to max_new_tokens.",
+    )
+    parser.add_argument(
         "--concurrent-generator-variant",
         choices=("auto", "shared"),
         default="auto",
@@ -166,7 +171,9 @@ async def main() -> None:
         model=args.model,
         tensor_parallel_size=1,
         max_num_seqs=1,
-        max_model_len=4096,
+        max_model_len=max(
+            4096, int(reasoner_data["max_new_tokens"]) + 512
+        ),
         gpu_memory_utilization=args.gpu_memory_utilization,
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         enforce_eager=args.reasoner_mode == "eager",
@@ -183,6 +190,7 @@ async def main() -> None:
         reasoner_params = SamplingParams(
             temperature=0.0,
             max_tokens=int(reasoner_data["max_new_tokens"]),
+            ignore_eos=args.reasoner_fixed_tokens,
         )
         
         def generator_request(request_id: str) -> Any:
@@ -269,6 +277,16 @@ async def main() -> None:
         concurrent_rows = []
         for index in range(args.concurrent_repeats):
             wall_started = time.perf_counter()
+            generator_handle = await engine.submit(
+                args.model_id,
+                generator_request(f"async-concurrent-generator-{index}"),
+                request_id=f"async-concurrent-generator-{index}",
+                variant=args.concurrent_generator_variant,
+            )
+            # 与同步 benchmark 保持相同的 generator-first 到达顺序：
+            # Generator 先在 full variant 上推进，Reasoner 到达后再触发
+            # shared，这样才会覆盖 autoscaling 的 full -> shared 转换。
+            reasoner_started = time.perf_counter()
             reasoner_handle = await engine.submit(
                 "reasoner",
                 {
@@ -276,13 +294,6 @@ async def main() -> None:
                     "sampling_params": reasoner_params,
                 },
                 request_id=f"async-concurrent-reasoner-{index}",
-            )
-            reasoner_started = wall_started
-            generator_handle = await engine.submit(
-                args.model_id,
-                generator_request(f"async-concurrent-generator-{index}"),
-                request_id=f"async-concurrent-generator-{index}",
-                variant=args.concurrent_generator_variant,
             )
 
             async def wait_reasoner() -> tuple[float, Any]:
@@ -319,6 +330,7 @@ async def main() -> None:
             "deployment_plan": engine.deployment_plan.to_rpc_payload(),
             "reasoner_graph_variants": graph_status,
             "reasoner_completion_tokens": len(final.token_ids),
+            "reasoner_fixed_tokens": args.reasoner_fixed_tokens,
             "performance": {
                 "reasoner_alone_samples": reasoner_samples,
                 "reasoner_alone_median": statistics.median(

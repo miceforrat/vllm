@@ -12,7 +12,9 @@
 
 判定：
   A 单独、B 单独各跑一次得到视频哈希；再背靠背提交 A、B（同一 seed）。
-  B 晚一个 wave 进入，所以 B 少一个去噪步，使两者在同一个 wave 进入 VAE。
+  先用一对校准请求测出第二个 submit 实际晚进入多少个 wave，再相应减少 B
+  的去噪步数，使 A、B 在同一个 wave 进入 VAE。不能把该偏移写死：ModelEmitter
+  会在两次前端 submit 之间继续推进模型。
   - 若共置时两者的 latent 哈希与单独时相同（去噪无差异），但视频哈希不同 → C3 存在。
   - 修好后（按请求保存 feat_cache），共置视频哈希应与单独完全一致。
 
@@ -43,8 +45,58 @@ async def main() -> None:
         log(await h.rpc(_probes.p_install_output_hasher, args.model_id))
         await h.run_generator("r3-warm", seed=0, variant="full")
 
-        # B 比 A 晚进入一个 wave，所以让 B 少一个去噪步：两者会在同一个 wave 里一起进入 VAE。
-        b_steps = max(2, args.steps - 1)
+        # ModelEmitter 不会为前端的两次 submit 建立隐式 barrier：A 被接纳后，
+        # emitter 可能在 B 到达前推进一个或多个 wave。先实测这个偏移，避免
+        # 用固定的 ``steps - 1`` 猜测时序。
+        cal_a = "r3-cal-A"
+        cal_b = "r3-cal-B"
+        ha = await h.submit_generator(cal_a, seed=101, variant="full")
+        hb = await h.submit_generator(cal_b, seed=102, variant="full")
+        await asyncio.gather(
+            ha.result(timeout=args.timeout), hb.result(timeout=args.timeout)
+        )
+        calibration = await h.rpc(_probes.p_get_state)
+        cal_events = [
+            event
+            for event in calibration["events"]
+            if {cal_a, cal_b} & set(event["request_ids"])
+        ]
+        first_b = next(
+            (
+                index
+                for index, event in enumerate(cal_events)
+                if cal_b in event["request_ids"]
+            ),
+            None,
+        )
+        if first_b is None:
+            verdict(
+                "C3",
+                None,
+                "校准请求 B 没有进入执行 wave，无法构造同 wave VAE 负载",
+                "检查 ModelEmitter 请求接纳和 Omni StepScheduler batching",
+            )
+            return
+        admission_lag = sum(
+            cal_a in event["request_ids"]
+            and cal_b not in event["request_ids"]
+            and "vae" not in event["tags"]
+            and "component:vae" not in event["tags"]
+            for event in cal_events[: first_b + 1]
+        )
+        b_steps = args.steps - admission_lag
+        log(
+            f"calibrated B admission lag={admission_lag} wave(s); "
+            f"A steps={args.steps}, B steps={b_steps}"
+        )
+        if b_steps < 2:
+            verdict(
+                "C3",
+                None,
+                f"校准得到的 admission lag={admission_lag} 过大，无法构造有效 B 请求",
+                "增大 --steps 后重试",
+            )
+            return
         await h.run_generator("r3-A-alone", seed=11, variant="full")
         await h.run_generator("r3-B-alone", seed=22, variant="full", steps=b_steps)
 
@@ -54,9 +106,26 @@ async def main() -> None:
         st = await h.rpc(_probes.p_get_state)
 
     hv, hl = st["hashes"], st["latent_hashes"]
-    shared_vae_waves = [e for e in st["events"] if "vae" in e["tags"]
-                        and {"r3-A-pair", "r3-B-pair"} <= set(e["request_ids"])]
+    def is_vae_wave(event: dict) -> bool:
+        # ExecutionSlice 通用化后采用稳定的 namespace tag；同时接受旧版
+        # ``vae``，方便同一脚本对比迁移前后的结果。
+        tags = set(event["tags"])
+        return "component:vae" in tags or "vae" in tags
+
+    shared_vae_waves = [
+        event
+        for event in st["events"]
+        if is_vae_wave(event)
+        and {"r3-A-pair", "r3-B-pair"} <= set(event["request_ids"])
+    ]
     log(f"VAE waves containing both A and B: {len(shared_vae_waves)}")
+    if not shared_vae_waves:
+        pair_events = [
+            event
+            for event in st["events"]
+            if {"r3-A-pair", "r3-B-pair"} & set(event["request_ids"])
+        ]
+        log(f"pair event sample: {pair_events[-12:]}")
     for name in ("A", "B"):
         log(f"{name}: latent alone={hl.get(f'r3-{name}-alone')} pair={hl.get(f'r3-{name}-pair')} | "
             f"video alone={hv.get(f'r3-{name}-alone', {}).get('hash')} pair={hv.get(f'r3-{name}-pair', {}).get('hash')}")

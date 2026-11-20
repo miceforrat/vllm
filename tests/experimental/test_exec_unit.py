@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -9,6 +10,7 @@ from vllm.experimental.model_instance_registry import ModelSpec
 from vllm.experimental.execution_slice import (
     ExecutionSliceDescriptor,
 )
+from vllm.experimental.worker.binding import ResourceAssignment
 from vllm.experimental.worker.exec_unit import (
     LLMExecUnit,
     OmniModelExecUnit,
@@ -92,6 +94,77 @@ def test_llm_exec_unit_rejects_invalid_work(
         unit.recv_job(None)
     with pytest.raises(RuntimeError, match="no runnable work"):
         _execute_next(unit)
+
+
+def test_llm_graph_variant_switch_uses_atomic_drain_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit, runner = _create_unit(monkeypatch)
+    calls: list[str] = []
+
+    class _ContextBinding:
+        @contextmanager
+        def activate(self):
+            yield self
+
+    class _Stream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def synchronize(self) -> None:
+            calls.append(f"sync:{self.name}")
+
+    class _StreamBinding:
+        def __init__(self, stream: _Stream) -> None:
+            self.stream = stream
+
+        @contextmanager
+        def activate(self, _runner: Any, *, synchronize_transition: bool):
+            calls.append(
+                f"enter:{self.stream.name}:{synchronize_transition}"
+            )
+            yield self
+
+    class _GraphBinding:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def validate_stream(self, _stream: Any) -> None:
+            pass
+
+        def activate(self, _runner: Any) -> None:
+            calls.append(f"graph:{self.name}")
+
+    output_stream = _Stream("output")
+    runner.output_copy_stream = output_stream
+    # 两个名字可能引用同一个 stream；切换时只能同步一次。
+    runner.async_output_copy_stream = output_stream
+    shared_stream = _Stream("shared")
+    full_stream = _Stream("full")
+
+    def assignment(name: str, stream: _Stream) -> ResourceAssignment:
+        context = _ContextBinding()
+        return ResourceAssignment(
+            context,
+            context,
+            _StreamBinding(stream),
+            _GraphBinding(name),
+        )
+
+    with unit.activate(assignment("shared", shared_stream)):
+        pass
+    calls.clear()
+
+    with unit.activate(assignment("full", full_stream)):
+        calls.append("execute")
+
+    assert calls == [
+        "graph:full",
+        "sync:shared",
+        "sync:output",
+        "enter:full:False",
+        "execute",
+    ]
 
 
 class _OmniRunner:

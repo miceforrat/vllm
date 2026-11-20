@@ -46,8 +46,12 @@ class _Frontend:
     def __init__(self) -> None:
         self.generate_calls: list[dict[str, Any]] = []
         self.rpc_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.prepared_requests: list[Any] = []
         self.llm_engine = SimpleNamespace(
-            engine_core=SimpleNamespace(shutdown=lambda timeout=None: None),
+            engine_core=SimpleNamespace(
+                add_request=self.prepared_requests.append,
+                shutdown=lambda timeout=None: None,
+            ),
             execution_unit_rpc=self._execution_unit_rpc,
         )
 
@@ -121,6 +125,7 @@ def test_submit_routes_native_and_worker_managed_requests() -> None:
                 "use_tqdm": False,
             }
         ]
+        assert frontend.prepared_requests == [{"prepared": True}]
 
         auxiliary = engine.submit(
             "generator",
@@ -137,15 +142,6 @@ def test_submit_routes_native_and_worker_managed_requests() -> None:
                 (
                     "reasoner",
                     native.request_id,
-                ),
-            ),
-            (
-                "submit_model_request",
-                (
-                    "reasoner",
-                    native.request_id,
-                    {"prepared": True},
-                    {},
                 ),
             ),
             ("finish_model_request", ("reasoner", native.request_id)),

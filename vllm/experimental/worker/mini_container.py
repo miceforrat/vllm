@@ -5,13 +5,17 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable
 
 from vllm.experimental.worker.binding import ResourceAssignment
+from vllm.experimental.worker.model_timeline import (
+    ModelGPUTimeline,
+    SliceExecutionRecord,
+)
 from vllm.experimental.worker.resource_manager import GraphVariantKey
 
 if TYPE_CHECKING:
@@ -58,12 +62,8 @@ class MiniContainer:
         self._runtime_added = runtime_added
         self._variant_step_counts: Counter[str] = Counter()
         self._active_assignment: ResourceAssignment | None = None
-        # 相邻 slice 可能使用不同的执行 stream。用双槽 event 链记录本模型
-        # 最近一次 GPU 提交的完成边界，避免资源变体切换越过此前同一 stream
-        # 上连续提交、但尚未完成的 slice。
-        self._completion_events: tuple[Any, Any] | None = None
-        self._completion_event_index = 0
-        self._last_done_event: Any | None = None
+        self._timeline = ModelGPUTimeline()
+        self._slice_records: deque[SliceExecutionRecord] = deque(maxlen=4096)
         self._require_graph = True
         self._closed = False
         self._lock = threading.RLock()
@@ -295,6 +295,7 @@ class MiniContainer:
         variant_name: str | None = None,
         work: Any | None = None,
         request_id: str | None = None,
+        execution_epoch: int | None = None,
     ) -> Any:
         """在选定资源环境中推进 ExecUnit 一次。"""
         with self._lock:
@@ -315,45 +316,225 @@ class MiniContainer:
                 require_graph=self._require_graph,
             )
             resource_transition = selected is not self._active_assignment
-            with self._exec_unit.activate(
-                selected, resource_transition=resource_transition
-            ):
-                execution_stream = selected.streams.stream
-                if self._last_done_event is not None:
-                    execution_stream.wait_event(self._last_done_event)
-                try:
-                    result = self._exec_unit.execute_slice(
+            timeline_span = None
+            try:
+                with self._exec_unit.activate(
+                    selected, resource_transition=resource_transition
+                ):
+                    execution_stream = selected.streams.stream
+                    with self._timeline.slice(
+                        execution_stream,
+                        dependent_streams=self._dependent_streams(),
+                    ) as timeline_span: # 统一使用timeline.slice
+                        result = self._exec_unit.execute_slice(
+                            selected_descriptor,
+                            request_id=request_id,
+                        )
+            except Exception as exc:
+                self._active_assignment = selected
+                name = "default" if selected_name is None else selected_name
+                self._variant_step_counts[name] += 1
+                if timeline_span is not None:
+                    self._record_slice(
                         selected_descriptor,
-                        request_id=request_id,
+                        name,
+                        request_id,
+                        execution_epoch,
+                        timeline_span,
+                        None,
+                        error=exc,
                     )
-                finally:
-                    # Event 必须在实际执行 stream 上、所有本 slice GPU 工作
-                    # 提交之后记录。即使执行抛错，也要保护已经提交的工作。
-                    completion = self._next_completion_event()
-                    completion.record(execution_stream)
-                    self._last_done_event = completion
+                raise
             self._active_assignment = selected
             name = "default" if selected_name is None else selected_name
             self._variant_step_counts[name] += 1
+            self._record_slice(
+                selected_descriptor,
+                name,
+                request_id,
+                execution_epoch,
+                timeline_span,
+                result,
+            )
             return result
 
-    def _next_completion_event(self) -> Any:
-        """返回可复用的 completion event，避免每个 slice 创建新 Event。"""
-        if self._completion_events is None:
-            import torch
+    def run_on_active_assignment(self, operation: Callable[[], Any]) -> Any:
+        """在最近一次 slice 的资源环境中继续执行其后半段。（继续调用，不切换资源）
 
-            self._completion_events = (
-                torch.cuda.Event(enable_timing=False),
-                torch.cuda.Event(enable_timing=False),
-            )
-        event = self._completion_events[self._completion_event_index]
-        self._completion_event_index ^= 1
-        return event
+        vLLM 将一个 scheduler batch 拆成 ``execute_model`` 与
+        ``sample_tokens`` 两次 Worker 调用。后者仍属于同一个执行 slice，
+        必须复用前者选择的 stream/graph 环境；否则 sampling 与 AsyncOutput
+        handoff 会退回调用线程的默认 stream，并越过资源变体切换边界。
+        """
+        with self._lock:
+            self._ensure_open()
+            selected = self._active_assignment
+            if selected is None:
+                raise RuntimeError(
+                    f"Container {self.model_id!r} has no active resource "
+                    "assignment"
+                )
+            with self._exec_unit.activate(
+                selected, resource_transition=False
+            ):
+                execution_stream = selected.streams.stream
+                with self._timeline.slice(
+                    execution_stream,
+                    dependent_streams=self._dependent_streams(),
+                ) as continuation:
+                    output = operation()
+            # sampling 是上一 scheduler slice 的后半段，不另造一条记录；把
+            # 记录的 GPU 结束 event 延伸到 sampling/output-copy 真正完成处。
+            if self._slice_records:
+                record = self._slice_records[-1]
+                record.timeline.end_event = continuation.end_event
+                record.timeline.host_end_seconds = (
+                    continuation.host_end_seconds
+                )
+            return output
+
+    def _dependent_streams(self) -> tuple[Any, ...]:
+        """返回 Runner 在 slice 内使用的辅助 GPU stream。"""
+        runner = getattr(self._exec_unit, "runner", None)
+        if runner is None:
+            return ()
+        return tuple(
+            stream
+            for name in ("output_copy_stream", "async_output_copy_stream")
+            if (stream := getattr(runner, name, None)) is not None
+        )
 
     def variant_step_counts(self) -> dict[str, int]:
         """返回该模型各资源变体的实际执行次数。"""
         with self._lock:
             return dict(self._variant_step_counts)
+
+    def slice_execution_records(self) -> tuple[dict[str, Any], ...]:
+        """返回 I6 观测记录；尚未完成的 GPU 区间不会触发 host 同步。"""
+        with self._lock:
+            return tuple(record.to_payload() for record in self._slice_records)
+
+    @property
+    def last_gpu_completion_event(self) -> Any | None:
+        return self._timeline.last_done_event
+
+    def partition_group(self, variant_name: str) -> str | None:
+        if self._description is None:
+            return None
+        return self._description.variant(variant_name).stream.partition_group
+
+    def participates_in_partition(self, partition_group: str) -> bool:
+        return self._description is not None and any(
+            variant.stream.partition_group == partition_group
+            for variant in self._description.execution_variants
+        )
+
+    def _record_slice(
+        self,
+        descriptor: ExecutionSliceDescriptor,
+        variant_name: str,
+        request_id: str | None,
+        execution_epoch: int | None,
+        timeline_span: Any,
+        result: Any,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        # profiling/warmup 以及少量兼容测试可能直接传入不带 slice 契约的
+        # 占位对象。它们仍要经过 GPU timeline，但没有可供 I6 记录的模型
+        # 语义，因此使用空 metadata/tag 和本地回退序号。
+        metadata = getattr(descriptor, "metadata", {})
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+        request_ids = tuple(
+            str(value) for value in metadata.get("request_ids", ())
+        )
+        if not request_ids and request_id is not None:
+            request_ids = (str(request_id),)
+        tags = frozenset(getattr(descriptor, "tags", ()))
+        operator_tags = sorted(
+            tag for tag in tags if tag.startswith("component:")
+        )
+        operator_class = operator_tags[0] if operator_tags else (
+            sorted(tags)[0] if tags else "unspecified"
+        )
+        actual_sm_count = None
+        if self._description is not None:
+            actual_sm_count = self._description.variant(
+                None if variant_name == "default" else variant_name
+            ).stream.sm_count
+        if actual_sm_count is None:
+            try:
+                import torch
+
+                stream = self._active_assignment.streams.stream
+                actual_sm_count = int(
+                    torch.cuda.get_device_properties(stream.device)
+                    .multi_processor_count
+                )
+            except (AttributeError, RuntimeError):
+                # CPU/fake-stream 单元测试没有物理 SM；字段保留为 None。
+                pass
+        predicted = metadata.get("predicted_seconds")
+        if error is not None:
+            result_summary = {
+                "request_done": True,
+                "status": "FAILED",
+                "error": f"{type(error).__name__}: {error}",
+            }
+        elif result is None:
+            # 原生 vLLM 的 profiling、warmup、非末级 PP，以及部分仅提交
+            # GPU 工作的 execute_model 调用都可以合法返回 None。I6 仍记录
+            # 这次 GPU slice，但不能把“没有 host 输出”解释成请求完成。
+            result_summary = {
+                "request_done": False,
+                "status": "NO_HOST_OUTPUT",
+            }
+        else:
+            if isinstance(result, dict):
+                request_done = bool(result.get("request_done", False))
+            else:
+                request_done = bool(
+                    getattr(result, "request_done", False)
+                )
+            result_summary = {
+                "request_done": request_done,
+            }
+            if not hasattr(result, "request_done") and not (
+                isinstance(result, dict) and "request_done" in result
+            ):
+                result_summary["status"] = "FRAMEWORK_OUTPUT"
+        result_metadata = (
+            result.get("metadata", {})
+            if isinstance(result, dict)
+            else getattr(result, "metadata", {}) if result is not None else {}
+        )
+        if isinstance(result_metadata, Mapping):
+            for key in ("status", "finished_request_ids", "error"):
+                if key in result_metadata:
+                    result_summary[key] = result_metadata[key]
+        self._slice_records.append(SliceExecutionRecord(
+            model_id=self.model_id,
+            request_ids=request_ids,
+            operator_class=operator_class,
+            resource_variant=variant_name,
+            actual_sm_count=actual_sm_count,
+            predicted_seconds=(
+                None if predicted is None else float(predicted)
+            ),
+            execution_epoch=(
+                None if execution_epoch is None else int(execution_epoch)
+            ),
+            sequence_no=int(
+                getattr(
+                    descriptor,
+                    "sequence_no",
+                    len(self._slice_records),
+                )
+            ),
+            timeline=timeline_span,
+            result=result_summary,
+        ))
 
     @staticmethod
     def _result_field(result: Any, name: str) -> Any:

@@ -203,7 +203,7 @@ def main() -> None:
         model=args.model,
         tensor_parallel_size=1,
         max_num_seqs=1,
-        max_model_len=4096,
+        max_model_len=max(4096, args.reasoner_max_tokens + 512),
         gpu_memory_utilization=args.gpu_memory_utilization,
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         enforce_eager=args.reasoner_mode == "eager",

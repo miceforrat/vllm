@@ -236,14 +236,10 @@ class MultiModelEngine:
         context = getattr(self._request_context, "current", None)
         if context is None:
             raise RuntimeError("No active multi-model request context")
-        model_id, request_id = context
-        self._frontend.llm_engine.execution_unit_rpc(
-            "submit_model_request",
-            model_id,
-            request_id,
-            request,
-            {},
-        )
+        # EngineCoreRequest 必须经过 CoreClient 的强类型请求通道。
+        # 若把它作为 Any 参数交给 utility RPC，msgspec 会将其
+        # 还原成普通映射，EngineCore 无法再执行原生 Scheduler 路径。
+        self._frontend.llm_engine.engine_core.add_request(request)
 
     def _run_vllm_preprocessor(
         self,

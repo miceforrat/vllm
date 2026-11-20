@@ -122,6 +122,9 @@ class ExecUnit(ABC, Generic[_WorkT, _ResultT]):
             f"{request_ids!r}"
         )
 
+    def assert_request_state_isolated(self) -> None:
+        """断言 Runner 没有在模型对象上遗留请求级可变状态。"""
+
     def bind_resources(
         self,
         assignment: ResourceAssignment,
@@ -185,6 +188,10 @@ class LLMExecUnit(ExecUnit[Any, Any]):
         self._worker: Any | None = None
         self._container: Any | None = None
         self._graph_manager: Any | None = None
+        # CUDA Graph 资源变体共享原生 Runner 的持久输入/输出状态。切换变体
+        # 时必须在同一处完成 graph 激活、旧 stream drain 和新 stream 绑定，
+        # 不能把这三步拆散到 Container/Binding 中。
+        self._active_graph_stream: Any | None = None
 
     def attach_native_runtime(
         self,
@@ -305,15 +312,52 @@ class LLMExecUnit(ExecUnit[Any, Any]):
             # stack用来动态组合多个 context manager，并保证按相反顺序退出。
             stack.enter_context(assignment.communicator.activate())
             stack.enter_context(assignment.memory.activate())
+
+            graph_transition = (
+                assignment.graph is not None and resource_transition
+            )
+            if graph_transition:
+                # 保持旧 MultiModelGPUWorker 已验证过的原子切换顺序：
+                # 1. 先令原生 graph manager 指向目标 executable；
+                # 2. 排空旧 compute stream；
+                # 3. 排空异步 output-copy stream；
+                # 4. 最后才把 Runner 绑定到目标执行 stream。
+                assignment.graph.activate(self.runner)
+                previous_stream = self._active_graph_stream
+                if previous_stream is not None:
+                    previous_stream.synchronize()
+                    synchronized: set[int] = set()
+                    for name in (
+                        "output_copy_stream",
+                        "async_output_copy_stream",
+                    ):
+                        output_stream = getattr(self.runner, name, None)
+                        if (
+                            output_stream is not None
+                            and id(output_stream) not in synchronized
+                        ):
+                            output_stream.synchronize()
+                            synchronized.add(id(output_stream))
+
+                target_stream = getattr(assignment.streams, "stream", None)
+                if target_stream is None:
+                    raise RuntimeError(
+                        "A CUDA Graph resource variant requires a concrete "
+                        "execution stream"
+                    )
+                self._active_graph_stream = target_stream
+
             stack.enter_context(
                 assignment.streams.activate(
                     self.runner,
-                    synchronize_transition=resource_transition,
+                    # Graph 切换已在上面完成 host drain，不能再经 caller
+                    # stream 建立另一套 wait_stream 依赖。非 graph 路径仍保留
+                    # StreamBinding 的通用切换协议。
+                    synchronize_transition=(
+                        resource_transition and assignment.graph is None
+                    ),
                 )
             )
-            if assignment.graph is not None and resource_transition:
-                # 如果decode开启graph执行，还需要额外切换graph环境
-                assignment.graph.activate(self.runner)
             yield
 
     def close(self) -> None:
@@ -876,6 +920,7 @@ class OmniModelExecUnit(ExecUnit[Any, Any]):
                 scheduler_output = self._pending_scheduler_output
                 self._pending_scheduler_output = None
             runner_output = self.runner.execute_stepwise(scheduler_output)
+            self.assert_request_state_isolated()
             with self._work_lock:
                 finished = self._step_scheduler.update_from_output(
                     scheduler_output, runner_output
@@ -924,6 +969,13 @@ class OmniModelExecUnit(ExecUnit[Any, Any]):
                     "terminal_requests": terminal_requests,
                 },
             )
+
+    def assert_request_state_isolated(self) -> None:
+        checker = getattr(
+            self.runner, "assert_request_state_isolated", None
+        )
+        if checker is not None:
+            checker()
 
     def bind_resources(
         self,

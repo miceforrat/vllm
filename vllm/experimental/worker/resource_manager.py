@@ -482,6 +482,11 @@ class GCStreamManager:
                     f"Green Context partition group {group!r} requires "
                     f"exactly two stream requirements, got {len(members)}"
                 )
+            if len({owner for owner, _ in members}) != 2:
+                raise ValueError(
+                    f"Green Context partition group {group!r} must contain "
+                    "two distinct model owners"
+                )
 
         with self._lock:
             conflicts = set(normalized).intersection(self._bindings)
@@ -678,7 +683,8 @@ class GCCudaGraphManager:
     构造 native manager。实现内部的完整 executable key 应为
     ``(GraphVariantKey, BatchExecutionDescriptor)``。
 
-    目前多个变体的input buffer仍然共享(因为现阶段只是迁移)
+    多个变体共享原生 manager 的持久输入/输出 buffer；切换安全性由执行边界
+    的 compute/output-copy 双 drain 保证。
     """
 
     def __init__(self) -> None:

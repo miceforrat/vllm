@@ -57,6 +57,9 @@ class _CoreClient:
             return [{"job_id": args[0], "rank": 0, "done": True}]
         raise AssertionError(f"Unexpected utility method: {method}")
 
+    async def add_request_async(self, request: Any) -> None:
+        self.owner.prepared_requests.append(request)
+
 
 class _Engine(AsyncMultiModelEngine):
     def __init__(self) -> None:
@@ -69,6 +72,7 @@ class _Engine(AsyncMultiModelEngine):
         )
         self.rpc_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.utility_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.prepared_requests: list[Any] = []
         self.native_kwargs: dict[str, Any] | None = None
         self.engine_core = _CoreClient(self)
 
@@ -119,21 +123,13 @@ def test_native_submit_preserves_async_output_stream() -> None:
             "sampling_params": "params",
             "request_id": "reasoner-1",
         }
+        assert engine.prepared_requests == [{"prepared": True}]
         assert engine.utility_calls == [
             (
                 "open_model_request",
                 (
                     "reasoner",
                     "reasoner-1",
-                ),
-            ),
-            (
-                "submit_model_request",
-                (
-                    "reasoner",
-                    "reasoner-1",
-                    {"prepared": True},
-                    {},
                 ),
             ),
             ("finish_model_request", ("reasoner", "reasoner-1")),

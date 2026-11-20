@@ -414,6 +414,14 @@ class MultiModelWorker(GPUWorker):
             request_id=request_id,
         )
 
+    def execution_slice_records(
+        self, model_id: str
+    ) -> tuple[dict[str, Any], ...]:
+        """读取一个模型的 I6 slice 记录，不等待尚未完成的 GPU event。"""
+        return self._container_registry.get(
+            model_id
+        ).slice_execution_records()
+
     def execute_slice(
         self,
         scheduled: ScheduledExecutionSlice | dict[str, Any],
@@ -428,12 +436,44 @@ class MultiModelWorker(GPUWorker):
             self._last_execution_epoch, decision.execution_epoch
         )
         container = self._container_registry.get(decision.model_id)
-        return container.execute_slice(
-            descriptor=decision.descriptor,
-            work=work,
-            variant_name=decision.resource_variant,
-            request_id=decision.request_id,
+        self._join_partition_predecessors(
+            container, decision.resource_variant
         )
+        execute_kwargs = {
+            "descriptor": decision.descriptor,
+            "work": work,
+            "variant_name": decision.resource_variant,
+            "request_id": decision.request_id,
+        }
+        # I6 epoch 是新 MiniContainer 契约的一部分；只实现旧 Worker
+        # 调用面的兼容 Container/测试替身仍可继续工作。
+        if isinstance(container, MiniContainer):
+            execute_kwargs["execution_epoch"] = decision.execution_epoch
+        return container.execute_slice(
+            **execute_kwargs,
+        )
+
+    def _join_partition_predecessors(
+        self, container: MiniContainer, variant_name: str
+    ) -> None:
+        """I5：进入受限档位前，等待同一次划分中其他模型的旧档位。"""
+        partition_group = getattr(container, "partition_group", None)
+        if partition_group is None:
+            # 兼容只实现 Worker 调用面接口的旧 Container/测试替身。
+            return
+        group = partition_group(variant_name)
+        if group is None:
+            return
+        target_stream = container.assignment(variant_name).streams.stream
+        for peer in self._container_registry.all():
+            if peer is container:
+                continue
+            participates = getattr(peer, "participates_in_partition", None)
+            if participates is None or not participates(group):
+                continue
+            event = getattr(peer, "last_gpu_completion_event", None)
+            if event is not None:
+                target_stream.wait_event(event)
 
     def start_model_request(
         self,
@@ -654,7 +694,7 @@ class MultiModelWorker(GPUWorker):
             # 请求，保留这个记录作为 driver shell，最终 idle 时统一回收。
             if pending_work == 0:
                 self._model_jobs.pop(request_id, None)
-        return {
+        response = {
             "model_id": model_id,
             "request_id": request_id,
             "rank": self.rank,
@@ -662,6 +702,11 @@ class MultiModelWorker(GPUWorker):
             "stopped": request_id in aborted or state is None,
             "pending_work": pending_work,
         }
+        if pending_work > 0:
+            response["next_slice"] = (
+                container.exec_unit.next_slice_spec().to_payload()
+            )
+        return response
 
     def reset_model_requests(self, model_id: str) -> dict[str, Any]:
         """模型 driver 异常后清空该模型的全部请求状态。"""
@@ -735,6 +780,8 @@ class MultiModelWorker(GPUWorker):
                 for job_id, state in self._model_jobs.items()
                 if state["model_id"] == container.model_id
             )
+        runner = getattr(container.exec_unit, "runner", None)
+        event_pool = getattr(runner, "async_output_event_pool", None)
         return {
             "rank": self.rank,
             "model_id": container.model_id,
@@ -749,6 +796,9 @@ class MultiModelWorker(GPUWorker):
             "variant_step_counts": variant_step_counts,
             "pending_work": container.exec_unit.pending_work_count,
             "model_job_ids": model_job_ids,
+            "async_output_event_pool": (
+                None if event_pool is None else event_pool.stats()
+            ),
         }
 
     def execute_model(self, scheduler_output: Any):
@@ -764,6 +814,12 @@ class MultiModelWorker(GPUWorker):
         return self.scheduler_container.execute_slice(
             work=scheduler_output,
             variant_name=None,
+        )
+
+    def sample_tokens(self, grammar_output: Any):
+        """在对应 forward 的同一资源环境中完成 sampling。"""
+        return self.scheduler_container.run_on_active_assignment(
+            lambda: GPUWorker.sample_tokens(self, grammar_output)
         )
 
     def _shutdown_model_runner(self) -> None:

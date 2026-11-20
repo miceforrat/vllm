@@ -19,6 +19,7 @@ from vllm.experimental.worker.resource_desc import (
     StreamResourceDescription,
 )
 from vllm.v1.core.sched.execution_slice_scheduler import ScheduledExecutionSlice
+from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 
 def _bare_worker(
@@ -165,6 +166,31 @@ def test_native_warmup_without_scheduled_slice_uses_default_variant() -> None:
 
     assert worker.execute_model(scheduler_output) == "warmup"
     assert events == [(scheduler_output, None)]
+
+
+def test_native_sampling_continues_on_active_assignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[Any] = []
+
+    class _Container:
+        def run_on_active_assignment(self, operation: Any) -> str:
+            events.append("active-assignment")
+            return operation()
+
+    worker = _bare_worker()
+    worker._container_registry = SimpleNamespace(
+        require_scheduler_managed=lambda: _Container()
+    )
+    monkeypatch.setattr(
+        GPUWorker,
+        "sample_tokens",
+        lambda _worker, grammar: events.append(("sample", grammar))
+        or "sampled",
+    )
+
+    assert worker.sample_tokens("grammar") == "sampled"
+    assert events == ["active-assignment", ("sample", "grammar")]
 
 
 def test_shutdown_delegates_runner_and_resources_to_container() -> None:
@@ -391,12 +417,13 @@ def test_model_request_slice_counts_each_wave_request_independently() -> None:
 
         @staticmethod
         def execute_slice(**_kwargs: Any) -> Any:
-            return SimpleNamespace(
-                request_done=False,
-                sequence_no=0,
-                tags=frozenset(("diffusion",)),
-                metadata={"finished_request_ids": ("A",)},
-            )
+                return SimpleNamespace(
+                    request_done=False,
+                    sequence_no=0,
+                    tags=frozenset(("diffusion",)),
+                    output={},
+                    metadata={"finished_request_ids": ("A",)},
+                )
 
         @staticmethod
         def _result_field(result: Any, name: str) -> Any:

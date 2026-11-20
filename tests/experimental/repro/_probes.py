@@ -133,6 +133,11 @@ def p_reset_state(wrapper: Any) -> str:
     st["events"].clear()
     st["counters"].clear()
     st.pop("final_window", None)
+    sample_probe = w.__dict__.get("_repro_sample_probe_state")
+    if sample_probe is not None:
+        # 调用方只会在一轮请求结束后 reset；丢弃上一组已经无须比较的
+        # sentinel，避免污染下一组阳性/现状统计。
+        sample_probe["pending"].clear()
     return "ok"
 
 
@@ -205,60 +210,121 @@ def p_install_output_hasher(wrapper: Any, model_id: str = "generator") -> str:
     return "installed"
 
 
-# --------------------------------------------------------------------------- C1（N4）：采样所在 stream
-def p_install_sample_probe(wrapper: Any, mode: str = "bug") -> str:
-    """包一层 Worker.sample_tokens / execute_model，记录采样运行在哪条 stream 上。
+# --------------------------------------------------------------------------- C1（N4）：采样实际提交 stream 与依赖
+def p_install_sample_probe(
+    wrapper: Any,
+    mode: str = "current",
+    sleep_cycles: int = 50_000_000,
+) -> str:
+    """在 ModelRunner 边界观测真正的 forward/sample GPU 提交。
 
-    mode:
-      "bug"  —— 不改行为，只记录（现状）；
-      "sync" —— 标准答案：每次 execute_model 之后、sample_tokens 前后都 torch.cuda.synchronize()，
-                消除一切跨 stream 竞争；kernel 与现状完全相同（采样仍在默认 stream），所以数值可直接比较；
-      "fix"  —— 模拟修法：把采样放到 forward 所在的 main_stream（变体 stream）上执行。
-                注意：lm_head 这时跑在 34 SM 的分区里，cuBLAS 选的 kernel 可能与整卡不同，
-                所以 fix 组与 sync 组的 token 不一定逐个相同；判断修法是否正确看 fix 组自身是否稳定。
+    ``current`` 完全保持现状。``positive`` 故意把 sample 放到一条没有
+    dependency 的 rogue stream，用来证明探针可以确定性识别 stream mismatch
+    和读早了的 forward sentinel。旧探针包在 Worker.sample_tokens 外层，观测
+    发生在 MiniContainer Binding 进入之前，因此不能代表采样 kernel 的 stream。
     """
     import torch
 
     w = _w(wrapper)
     st = _state(w)
     st["sample_mode"] = mode
+    st["sample_probe_sleep_cycles"] = int(sleep_cycles)
     if w.__dict__.get("_repro_sample_probe"):
         return f"already installed (mode -> {mode})"
-    orig_sample = type(w).sample_tokens.__get__(w)
-    orig_exec = type(w).execute_model.__get__(w)
+    runner = w.model_runner
+    orig_sample = runner.sample_tokens
+    orig_exec = runner.execute_model
+    device = torch.cuda.current_device()
+    rogue_stream = torch.cuda.Stream(device=device)
+    sentinel = torch.zeros((), dtype=torch.int64, device=device)
+    probe = {
+        "generation": 0,
+        "forward_stream": None,
+        "pending": [],
+        "rogue_stream": rogue_stream,
+        "sentinel": sentinel,
+    }
+    w.__dict__["_repro_sample_probe_state"] = probe
 
     def execute_model(*args, **kwargs):
         out = orig_exec(*args, **kwargs)
-        if st.get("sample_mode") == "sync":
-            torch.cuda.synchronize()
+        stream = torch.cuda.current_stream()
+        probe["generation"] += 1
+        generation = probe["generation"]
+        probe["forward_stream"] = int(stream.cuda_stream)
+        st["counters"]["last_forward_stream"] = hex(
+            probe["forward_stream"]
+        )
+        cycles = int(st.get("sample_probe_sleep_cycles", 0))
+        if cycles:
+            torch.cuda._sleep(cycles)
+        sentinel.fill_(generation)
         return out
 
-    def sample_tokens(*args, **kwargs):
-        runner = getattr(w, "model_runner", None)
-        main = runner.__dict__.get("main_stream") if runner is not None else None
+    def observe_sample_stream() -> None:
         cur = torch.cuda.current_stream()
+        current_handle = int(cur.cuda_stream)
+        forward_handle = probe["forward_stream"]
+        expected = int(probe["generation"])
         _bump(st, "sample_calls")
-        st["counters"]["last_sample_stream"] = hex(int(cur.cuda_stream))
-        st["counters"]["last_forward_stream"] = (
-            None if main is None else hex(int(main.cuda_stream))
-        )
-        if main is not None and int(cur.cuda_stream) != int(main.cuda_stream):
+        st["counters"]["last_sample_stream"] = hex(current_handle)
+        if forward_handle is not None and current_handle != forward_handle:
             _bump(st, "sample_on_other_stream")
-        mode_now = st.get("sample_mode")
-        if mode_now == "fix" and main is not None:
-            with torch.cuda.stream(main):
-                return orig_sample(*args, **kwargs)
-        if mode_now == "sync":
-            torch.cuda.synchronize()
-            out = orig_sample(*args, **kwargs)
-            torch.cuda.synchronize()
-            return out
+        observed = torch.empty_like(sentinel)
+        observed.copy_(sentinel)
+        done = torch.cuda.Event(enable_timing=False)
+        done.record(cur)
+        probe["pending"].append((expected, observed, done))
+
+    def sample_tokens(*args, **kwargs):
+        if st.get("sample_mode") == "positive":
+            # 只把 sentinel 读放到 rogue stream；真正 sampling 仍走当前正确
+            # stream，避免阳性对照故意破坏模型状态甚至触发 illegal access。
+            with torch.cuda.stream(rogue_stream):
+                observe_sample_stream()
+            return orig_sample(*args, **kwargs)
+        observe_sample_stream()
         return orig_sample(*args, **kwargs)
 
-    w.execute_model = execute_model
-    w.sample_tokens = sample_tokens
+    runner.execute_model = execute_model
+    runner.sample_tokens = sample_tokens
     w.__dict__["_repro_sample_probe"] = True
     return f"installed (mode={mode})"
+
+
+def p_get_sample_probe_state(wrapper: Any) -> dict[str, Any]:
+    """解析 C1 GPU sentinel；同步只发生在一轮请求全部结束以后。"""
+    w = _w(wrapper)
+    st = _state(w)
+    probe = w.__dict__.get("_repro_sample_probe_state")
+    if probe is None:
+        return {"installed": False}
+    observations = []
+    violations = 0
+    for expected, observed, done in probe["pending"]:
+        done.synchronize()
+        actual = int(observed.item())
+        bad = actual != expected
+        violations += int(bad)
+        observations.append({
+            "expected": expected,
+            "observed": actual,
+            "ordered": not bad,
+        })
+    probe["pending"].clear()
+    counters = dict(st["counters"])
+    return {
+        "installed": True,
+        "mode": st.get("sample_mode"),
+        "sample_calls": counters.get("sample_calls", 0),
+        "sample_on_other_stream": counters.get(
+            "sample_on_other_stream", 0
+        ),
+        "ordering_violations": violations,
+        "last_sample_stream": counters.get("last_sample_stream"),
+        "last_forward_stream": counters.get("last_forward_stream"),
+        "observations": observations[-32:],
+    }
 
 
 # --------------------------------------------------------------------------- C2（N3）：强制变体切换 + 放大窗口

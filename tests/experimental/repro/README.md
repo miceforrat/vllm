@@ -54,9 +54,8 @@ python r6_c11_sync_points.py --model $M --generator-cache sea_cache
 ## 输出怎么对应到病灶
 | 看到的输出 | 说明 | 病灶 | 改哪里（完整代码见 Cosmos3_GC_code_fixes_and_tests.md 第 4 节） |
 |---|---|---|---|
-| r1：`sample_on_other_stream > 0` | lm_head + 采样跑在 legacy default stream（整卡 SM），与 forward 无依赖 | C1 | `MultiModelWorker` 覆写 `sample_tokens`，经 `MiniContainer.run_on_active_assignment` 在同一变体 stream 执行 |
-| r1：现状组有轮次与标准答案组（每步强制同步）不同 | 采样读到没写完的 hidden_states，输出已经出错 | C1 | 同上 |
-| r1：模拟修复组各轮之间仍不一致 | 还有别的跨 stream 竞争（AsyncOutput 拷贝、postprocess） | C1 | 把 postprocess 也放进同一 slice（F2 的 ModelTimeline） |
+| r1：阳性对照出现 mismatch + sentinel 乱序 | 新探针能够识别真实的跨 stream 无依赖读取；不会故意让模型 sampling 走错误 stream | C1 探针自检 | 这是有效测试的前提，不代表当前实现有 bug |
+| r1：current 出现 stream mismatch 或 sentinel 乱序 | sampling 的真实 GPU 提交没有复用 forward stream/依赖 | C1 | `MultiModelWorker.sample_tokens` 经 `MiniContainer.run_on_active_assignment` 进入同一 assignment，并由 ModelTimeline 串接 |
 | r2：现状视频哈希 ≠ 对照（sync）哈希，event-fix 后一致 | 切换变体时新 stream 没等旧 stream 上的连续 slice | C2 | `MiniContainer` 增加 per-model `last_done` event；`CudaStreamBinding._activate` 去掉经 caller 的依赖 |
 | r2：latent 哈希就不同 | 去噪阶段有别的非确定性 | （先排查） | 关 SeaCache、固定 cuDNN 算法后重跑 |
 | r2：reserved 显存在切换运行后明显增加 | 生成器在两条 stream 上各缓存一份激活 | C14 | 限制生成器使用的档位数；层块走 graph 固定内存池 |

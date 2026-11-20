@@ -151,6 +151,16 @@ class ResourceDescription:
         variant_names = [variant.name for variant in self.execution_variants]
         if len(variant_names) != len(set(variant_names)):
             raise ValueError("Execution variant names must be unique")
+        green_variants = [
+            variant.name
+            for variant in self.execution_variants
+            if variant.stream.kind == "green_context"
+        ]
+        if len(green_variants) > 1:
+            raise ValueError(
+                "I5 currently supports one nested Green Context tier per "
+                f"model; got {green_variants!r}"
+            )
 
         if self.default_variant is None:
             if len(self.execution_variants) > 1:

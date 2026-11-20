@@ -88,6 +88,16 @@ class EngineDeploymentPlan:
                 "Each Green Context partition group requires exactly two "
                 f"members, got {invalid!r}"
             )
+        repeated_owner = {
+            group: members
+            for group, members in partition_members.items()
+            if len({model_id for model_id, _ in members}) != len(members)
+        }
+        if repeated_owner:
+            raise ValueError(
+                "A Green Context partition must be assembled from distinct "
+                f"model owners, got {repeated_owner!r}"
+            )
 
     @classmethod
     def from_rpc_payload(
@@ -104,4 +114,3 @@ class EngineDeploymentPlan:
 
     def to_rpc_payload(self) -> dict[str, Any]:
         return asdict(self)
-

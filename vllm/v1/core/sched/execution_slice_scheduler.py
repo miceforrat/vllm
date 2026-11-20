@@ -59,6 +59,8 @@ class ExecutionSliceScheduler:
         self._model_demand: dict[str, int] = {}
         self._model_variants: dict[str, tuple[str, str | None]] = {}
         self._next_execution_epoch = 0
+        self._selected_variants: dict[str, str] = {}
+        self._variant_transitions: list[dict[str, Any]] = []
         self._revision = 0
         self._lock = threading.RLock()
 
@@ -155,10 +157,34 @@ class ExecutionSliceScheduler:
                 else full_variant
             )
             requested = descriptor.metadata.get("requested_variant")
-            if requested not in (None, "auto"):
+            explicit = requested not in (None, "auto")
+            if explicit:
                 requested = str(requested)
                 self.validate_requested_variant(model_id, requested)
                 variant = requested
+            previous = self._selected_variants.get(model_id)
+            full_to_shared = (
+                previous == full_variant and variant == shared_variant
+            )
+            shared_to_full = (
+                previous == shared_variant and variant == full_variant
+            )
+            if variant == full_variant and contended:
+                raise RuntimeError(
+                    "I5 violation: a model cannot use or expand to its full "
+                    "tier while another model still has demand"
+                )
+            if previous != variant:
+                self._variant_transitions.append({
+                    "model_id": model_id,
+                    "from": previous,
+                    "to": variant,
+                    "kind": (
+                        "shrink" if full_to_shared else
+                        "expand" if shared_to_full else "initial"
+                    ),
+                })
+                self._selected_variants[model_id] = variant
             self._next_execution_epoch += 1
             return ScheduledExecutionSlice(
                 model_id=model_id,
@@ -196,4 +222,6 @@ class ExecutionSliceScheduler:
                     for model_id, variants in self._model_variants.items()
                 },
                 "next_execution_epoch": self._next_execution_epoch,
+                "selected_variants": dict(self._selected_variants),
+                "variant_transitions": tuple(self._variant_transitions),
             }

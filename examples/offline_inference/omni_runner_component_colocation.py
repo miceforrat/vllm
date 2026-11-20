@@ -256,6 +256,14 @@ def main() -> None:
         help="Ignore EOS to create a controlled decode-length benchmark.",
     )
     parser.add_argument("--generator-sm-count", type=int, default=136)
+    parser.add_argument(
+        "--full-sm-baseline",
+        action="store_true",
+        help=(
+            "Run both components on ordinary full-device streams to collect "
+            "the 170-SM normalization baseline."
+        ),
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.70)
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=1 << 30)
     parser.add_argument("--generator-cache", choices=("none", "sea_cache"), default="sea_cache")
@@ -298,9 +306,26 @@ def main() -> None:
     from vllm.experimental.green_context import GreenContextPair
 
     device = torch.cuda.current_device()
-    gc_pair = GreenContextPair(args.generator_sm_count, device)
-    generator_stream = torch.cuda.ExternalStream(gc_pair.first_stream_ptr, device=device)
-    decode_stream = torch.cuda.ExternalStream(gc_pair.second_stream_ptr, device=device)
+    gc_pair = None
+    if args.full_sm_baseline:
+        generator_stream = torch.cuda.Stream(device=device)
+        decode_stream = torch.cuda.Stream(device=device)
+        total_sm_count = int(
+            torch.cuda.get_device_properties(device).multi_processor_count
+        )
+        generator_sm_count = total_sm_count
+        decode_sm_count = total_sm_count
+    else:
+        gc_pair = GreenContextPair(args.generator_sm_count, device)
+        generator_stream = torch.cuda.ExternalStream(
+            gc_pair.first_stream_ptr, device=device
+        )
+        decode_stream = torch.cuda.ExternalStream(
+            gc_pair.second_stream_ptr, device=device
+        )
+        total_sm_count = int(gc_pair.total_sm_count)
+        generator_sm_count = int(gc_pair.first_sm_count)
+        decode_sm_count = int(gc_pair.second_sm_count)
     embedded.set_execution_stream(generator_stream)
 
     from vllm import LLM
@@ -328,7 +353,7 @@ def main() -> None:
         )
 
     print(
-        f"partition generator={gc_pair.first_sm_count} decode={gc_pair.second_sm_count} "
+        f"partition generator={generator_sm_count} decode={decode_sm_count} "
         f"component={args.component} coverage={args.coverage} tokens={max_tokens}",
         flush=True,
     )
@@ -464,9 +489,10 @@ def main() -> None:
         "requested_coverage": args.coverage,
         "partition": {
             "requested_generator_sm_count": args.generator_sm_count,
-            "actual_generator_sm_count": gc_pair.first_sm_count,
-            "actual_decode_sm_count": gc_pair.second_sm_count,
-            "total_sm_count": gc_pair.total_sm_count,
+            "actual_generator_sm_count": generator_sm_count,
+            "actual_decode_sm_count": decode_sm_count,
+            "total_sm_count": total_sm_count,
+            "full_sm_baseline": args.full_sm_baseline,
         },
         "reasoner_mode": args.reasoner_mode,
         "generator_mode": "regional_compile",
@@ -493,7 +519,8 @@ def main() -> None:
     reasoner.llm_engine.engine_core.shutdown()
     if graph_patch is not None:
         graph_patch.restore()
-    gc_pair.close()
+    if gc_pair is not None:
+        gc_pair.close()
 
 
 if __name__ == "__main__":
