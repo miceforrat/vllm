@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import statistics
 import time
@@ -32,6 +33,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reasoner-mode", choices=("eager", "graph"), default="graph"
+    )
+    parser.add_argument(
+        "--reasoner-graph-buffer-mode",
+        choices=("shared", "isolated"),
+        default="shared",
+        help=(
+            "Use one persistent input/metadata buffer bundle per Reasoner "
+            "CUDA Graph resource variant."
+        ),
+    )
+    parser.add_argument(
+        "--reasoner-graph-transition-sync-mode",
+        choices=("host", "timeline", "variant_output"),
+        default="host",
+        help=(
+            "Use the legacy host drain or the per-model GPU timeline when "
+            "switching Reasoner CUDA Graph resource variants."
+        ),
     )
     parser.add_argument(
         "--generator-cache",
@@ -81,6 +100,12 @@ def deployment_plan(
     # 这里可以设置多种资源变体，比如reasoner有两种：拿34SM或者full SM
     reasoner_resources = ResourceDescription(
         memory=MemoryResourceDescription(kind="default"),
+        graph_buffer_mode=getattr(
+            args, "reasoner_graph_buffer_mode", "shared"
+        ),
+        graph_transition_sync_mode=getattr(
+            args, "reasoner_graph_transition_sync_mode", "host"
+        ),
         execution_variants=(
             ExecutionVariantDescription(
                 name="shared",
@@ -325,11 +350,17 @@ async def main() -> None:
         graph_status = await engine.collective_rpc("model_execution_status")
         assert completion is not None
         final = completion.outputs[0]
+        reasoner_token_sha256 = hashlib.sha256(
+            json.dumps(
+                final.token_ids, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
         report = {
             "engine": "AsyncMultiModelEngine",
             "deployment_plan": engine.deployment_plan.to_rpc_payload(),
             "reasoner_graph_variants": graph_status,
             "reasoner_completion_tokens": len(final.token_ids),
+            "reasoner_token_sha256": reasoner_token_sha256,
             "reasoner_fixed_tokens": args.reasoner_fixed_tokens,
             "performance": {
                 "reasoner_alone_samples": reasoner_samples,

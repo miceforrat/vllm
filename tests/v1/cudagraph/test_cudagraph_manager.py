@@ -118,6 +118,40 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     mock_cuda_graph.assert_called_once()
 
 
+def test_model_graph_resource_variants_can_isolate_output_buffers(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    manager = gpu_cudagraph_utils.ModelCudaGraphManager(
+        vllm_config=_create_vllm_config(),
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL,
+        decode_query_len=1,
+    )
+    manager.configure_resource_variant_output_isolation(True)
+
+    manager.activate_resource_variant("shared")
+    shared = torch.zeros(4)
+    manager.hidden_states = shared
+    manager.activate_resource_variant("full")
+    assert manager.hidden_states is None
+    full = torch.ones(4)
+    manager.hidden_states = full
+
+    assert manager.resource_variant_output_pointers("shared") == {
+        "output.hidden_states": shared.data_ptr()
+    }
+    assert manager.resource_variant_output_pointers("full") == {
+        "output.hidden_states": full.data_ptr()
+    }
+    manager.activate_resource_variant("shared")
+    assert manager.hidden_states is shared
+
+
 def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
     num_reqs = 32
     num_tokens = 56

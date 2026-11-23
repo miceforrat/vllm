@@ -650,6 +650,88 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+        self._isolate_resource_variant_outputs = False
+        self._outputs_by_resource_variant: dict[
+            Hashable,
+            tuple[
+                torch.Tensor | None,
+                list[torch.Tensor],
+                IntermediateTensors | None,
+            ],
+        ] = {}
+
+    def configure_resource_variant_output_isolation(
+        self, enabled: bool
+    ) -> None:
+        """选择不同 resource variant 是否使用独立持久输出地址。"""
+        enabled = bool(enabled)
+        if self._captured_resource_variants:
+            raise RuntimeError(
+                "Graph output isolation must be configured before capture"
+            )
+        self._isolate_resource_variant_outputs = enabled
+
+    def _current_output_buffers(
+        self,
+    ) -> tuple[
+        torch.Tensor | None,
+        list[torch.Tensor],
+        IntermediateTensors | None,
+    ]:
+        return (
+            self.hidden_states,
+            self.aux_hidden_states,
+            self.intermediate_tensors,
+        )
+
+    def activate_resource_variant(self, variant: Hashable) -> None:
+        if not self._isolate_resource_variant_outputs:
+            super().activate_resource_variant(variant)
+            return
+        current = self.active_resource_variant
+        self._outputs_by_resource_variant[current] = (
+            self._current_output_buffers()
+        )
+        super().activate_resource_variant(variant)
+        (
+            self.hidden_states,
+            self.aux_hidden_states,
+            self.intermediate_tensors,
+        ) = self._outputs_by_resource_variant.get(
+            variant, (None, [], None)
+        )
+
+    def clear_resource_variant(self, variant: Hashable) -> None:
+        super().clear_resource_variant(variant)
+        self._outputs_by_resource_variant.pop(variant, None)
+
+    def resource_variant_output_pointers(
+        self, variant: Hashable
+    ) -> dict[str, int]:
+        """返回某个变体的 graph 输出地址，不改变当前激活变体。"""
+        if (
+            self._isolate_resource_variant_outputs
+            and variant != self.active_resource_variant
+        ):
+            outputs = self._outputs_by_resource_variant.get(
+                variant, (None, [], None)
+            )
+        else:
+            outputs = self._current_output_buffers()
+        hidden, auxiliary, intermediate = outputs
+        result: dict[str, int] = {}
+        if hidden is not None:
+            result["output.hidden_states"] = int(hidden.data_ptr())
+        for index, tensor in enumerate(auxiliary):
+            result[f"output.aux_hidden_states[{index}]"] = int(
+                tensor.data_ptr()
+            )
+        if intermediate is not None:
+            for name, tensor in intermediate.tensors.items():
+                result[f"output.intermediate_tensors.{name}"] = int(
+                    tensor.data_ptr()
+                )
+        return result
 
     def capture(
         self,

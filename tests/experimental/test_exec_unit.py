@@ -15,6 +15,7 @@ from vllm.experimental.worker.exec_unit import (
     LLMExecUnit,
     OmniModelExecUnit,
 )
+from vllm.experimental.worker.resource_desc import ResourceDescription
 
 
 class _Runner:
@@ -96,8 +97,17 @@ def test_llm_exec_unit_rejects_invalid_work(
         _execute_next(unit)
 
 
-def test_llm_graph_variant_switch_uses_atomic_drain_order(
+@pytest.mark.parametrize(
+    ("sync_mode", "expected_sync_calls"),
+    [
+        ("host", ["sync:shared", "sync:output"]),
+        ("timeline", []),
+    ],
+)
+def test_llm_graph_variant_switch_uses_configured_transition_order(
     monkeypatch: pytest.MonkeyPatch,
+    sync_mode: str,
+    expected_sync_calls: list[str],
 ) -> None:
     unit, runner = _create_unit(monkeypatch)
     calls: list[str] = []
@@ -141,6 +151,14 @@ def test_llm_graph_variant_switch_uses_atomic_drain_order(
     runner.async_output_copy_stream = output_stream
     shared_stream = _Stream("shared")
     full_stream = _Stream("full")
+    unit._container = SimpleNamespace(  # noqa: SLF001
+        resource_description=ResourceDescription(
+            graph_buffer_mode=(
+                "isolated" if sync_mode == "timeline" else "shared"
+            ),
+            graph_transition_sync_mode=sync_mode,
+        )
+    )
 
     def assignment(name: str, stream: _Stream) -> ResourceAssignment:
         context = _ContextBinding()
@@ -160,8 +178,7 @@ def test_llm_graph_variant_switch_uses_atomic_drain_order(
 
     assert calls == [
         "graph:full",
-        "sync:shared",
-        "sync:output",
+        *expected_sync_calls,
         "enter:full:False",
         "execute",
     ]

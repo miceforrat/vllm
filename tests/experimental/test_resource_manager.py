@@ -44,11 +44,18 @@ def test_resource_description_selects_normalized_execution_variant() -> None:
         ),
         execution_variants=(shared, full),
         default_variant="shared",
+        graph_buffer_mode="isolated",
+        graph_transition_sync_mode="timeline",
     )
 
     assert description.variant() is shared
     assert description.variant("full") is full
     assert description.communication_groups == (tp,)
+    assert description.graph_buffer_mode == "isolated"
+    assert description.graph_transition_sync_mode == "timeline"
+    assert ResourceDescription.from_rpc_payload(
+        description.to_rpc_payload()
+    ) == description
 
 
 def test_green_context_description_requires_partition_information() -> None:
@@ -72,6 +79,16 @@ def test_resource_description_rejects_ambiguous_defaults() -> None:
 
     with pytest.raises(ValueError, match="default_variant is required"):
         ResourceDescription(execution_variants=variants)
+
+
+def test_resource_description_rejects_unknown_graph_buffer_mode() -> None:
+    with pytest.raises(ValueError, match="graph_buffer_mode"):
+        ResourceDescription(graph_buffer_mode="unknown")  # type: ignore[arg-type]
+
+
+def test_timeline_graph_transition_requires_isolated_buffers() -> None:
+    with pytest.raises(ValueError, match="require isolated graph buffers"):
+        ResourceDescription(graph_transition_sync_mode="timeline")
 
 
 def test_resource_description_rejects_duplicate_parallel_dimensions() -> None:
@@ -367,6 +384,18 @@ class _GraphStreamBinding:
             self._events.append(f"exit:{self.stream.cuda_stream}")
 
 
+class _GraphBufferBundle:
+    def __init__(self, name: str, events: list[str]) -> None:
+        self.name = name
+        self._events = events
+
+    def activate(self) -> None:
+        self._events.append(f"buffers:{self.name}")
+
+    def data_ptrs(self) -> dict[str, int]:
+        return {"input": 11 if self.name == "shared" else 22}
+
+
 def test_unified_graph_manager_reuses_one_native_manager_for_variants() -> None:
     events: list[str] = []
     native = _GraphNativeManager()
@@ -374,6 +403,8 @@ def test_unified_graph_manager_reuses_one_native_manager_for_variants() -> None:
     manager.register_model("reasoner", native)
     shared = GraphVariantKey("reasoner", "shared")
     full = GraphVariantKey("reasoner", "full")
+    shared_buffers = _GraphBufferBundle("shared", events)
+    full_buffers = _GraphBufferBundle("full", events)
 
     def capture_native(*, size: int) -> int:
         events.append(f"capture:{native.active.variant_name}")
@@ -383,12 +414,14 @@ def test_unified_graph_manager_reuses_one_native_manager_for_variants() -> None:
         shared,
         _GraphStreamBinding(11, events),
         capture_native,
+        buffer_bundle=shared_buffers,
         size=8,
     ) == 8
     assert manager.capture_variant(
         full,
         _GraphStreamBinding(22, events),
         capture_native,
+        buffer_bundle=full_buffers,
         size=9,
     ) == 9
 
@@ -398,13 +431,21 @@ def test_unified_graph_manager_reuses_one_native_manager_for_variants() -> None:
     manager.binding(full).activate(runner)
     assert native.active == full
     assert runner.cudagraph_manager is native
+    assert manager.buffer_pointers("reasoner") == {
+        "shared": {"input": 11},
+        "full": {"input": 22},
+    }
     assert events == [
+        "buffers:shared",
         "enter:11",
         "capture:shared",
         "exit:11",
+        "buffers:full",
         "enter:22",
         "capture:full",
         "exit:22",
+        "buffers:shared",
+        "buffers:full",
     ]
 
     manager.release_model("reasoner")

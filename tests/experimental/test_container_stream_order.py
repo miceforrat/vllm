@@ -58,6 +58,68 @@ def test_model_timeline_chains_every_slice_and_records_failures() -> None:
     ]
 
 
+def test_model_timeline_only_joins_output_when_variant_buffer_reused() -> None:
+    records: list[tuple[str, str]] = []
+
+    class _Event:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def record(self, stream: Any) -> None:
+            records.append(("record", f"{self.name}:{stream.name}"))
+
+    class _Stream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def wait_event(self, event: _Event) -> None:
+            records.append(("wait", f"{event.name}:{self.name}"))
+
+        def wait_stream(self, stream: Any) -> None:
+            records.append(("join", f"{stream.name}:{self.name}"))
+
+    names = iter(
+        (
+            "shared-start",
+            "shared-compute",
+            "shared-output",
+            "full-start",
+            "full-compute",
+            "full-output",
+            "shared2-start",
+            "shared2-compute",
+            "shared2-output",
+        )
+    )
+    timeline = ModelGPUTimeline(
+        event_factory=lambda: _Event(next(names))
+    )
+    with timeline.slice(
+        _Stream("shared"),
+        dependent_streams=(_Stream("shared-copy"),),
+        independent_tail_key="shared",
+    ):
+        pass
+    with timeline.slice(
+        _Stream("full"),
+        dependent_streams=(_Stream("full-copy"),),
+        independent_tail_key="full",
+    ):
+        pass
+    with timeline.slice(
+        _Stream("shared2"),
+        independent_tail_key="shared",
+    ):
+        pass
+
+    # full 只等 shared 的计算边界，不等 shared-output；再次使用 shared
+    # buffer 时，同时等待最新 full 计算和旧 shared output-copy 完成。
+    assert ("wait", "shared-compute:full") in records
+    assert ("wait", "shared-output:full") not in records
+    assert ("wait", "full-compute:shared2") in records
+    assert ("wait", "shared-output:shared2") in records
+
+
 def test_container_records_one_observation_per_execution_slice() -> None:
     class _Event:
         def record(self, stream: Any) -> None:

@@ -793,6 +793,21 @@ class MultiModelWorker(GPUWorker):
                 if graph_registered
                 else {}
             ),
+            "graph_buffer_mode": (
+                container.resource_description.graph_buffer_mode
+                if container.resource_description is not None
+                else None
+            ),
+            "graph_transition_sync_mode": (
+                container.resource_description.graph_transition_sync_mode
+                if container.resource_description is not None
+                else None
+            ),
+            "graph_buffer_pointers": (
+                self._graph_manager.buffer_pointers(container.model_id)
+                if graph_registered
+                else {}
+            ),
             "variant_step_counts": variant_step_counts,
             "pending_work": container.exec_unit.pending_work_count,
             "model_job_ids": model_job_ids,

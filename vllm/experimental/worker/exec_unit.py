@@ -41,6 +41,129 @@ _ResultT = TypeVar("_ResultT")
 OmniStepResult = ExecutionSliceResult
 
 
+@dataclass
+class _LLMBlockTableGraphBuffers:
+    input_block_tables: list[Any]
+    input_block_table_ptrs: Any
+    slot_mappings: Any
+
+    @classmethod
+    def current(cls, block_tables: Any) -> _LLMBlockTableGraphBuffers:
+        return cls(
+            input_block_tables=block_tables.input_block_tables,
+            input_block_table_ptrs=block_tables.input_block_table_ptrs,
+            slot_mappings=block_tables.slot_mappings,
+        )
+
+    def clone(self, block_tables: Any) -> _LLMBlockTableGraphBuffers:
+        import torch
+
+        input_block_tables = [
+            torch.zeros_like(item) for item in self.input_block_tables
+        ]
+        return type(self)(
+            input_block_tables=input_block_tables,
+            input_block_table_ptrs=block_tables._make_ptr_tensor(
+                input_block_tables
+            ),
+            slot_mappings=torch.zeros_like(self.slot_mappings),
+        )
+
+    def activate(self, block_tables: Any) -> None:
+        block_tables.input_block_tables = self.input_block_tables
+        block_tables.input_block_table_ptrs = self.input_block_table_ptrs
+        block_tables.slot_mappings = self.slot_mappings
+
+
+@dataclass
+class _LLMGraphBufferBundle:
+    """一个 vLLM graph variant 捕获并重放时使用的持久地址集合。
+
+    CUDA Graph 内部临时输出由每次 capture 自己的 graph pool 持有；这里隔离
+    Runner 在 capture 外创建、并会在每次 replay 前写入的输入和元数据 buffer。
+    第一版只支持当前实验所用的非 PCP、非 speculative、单 PP rank 路径。
+    """
+
+    runner: Any
+    input_buffers: Any
+    block_tables: Any
+    block_table_buffers: _LLMBlockTableGraphBuffers
+    intermediate_tensors: Any
+
+    @classmethod
+    def current(cls, runner: Any) -> _LLMGraphBufferBundle:
+        return cls(
+            runner=runner,
+            input_buffers=runner.input_buffers,
+            block_tables=runner.block_tables,
+            block_table_buffers=_LLMBlockTableGraphBuffers.current(
+                runner.block_tables
+            ),
+            intermediate_tensors=getattr(runner, "intermediate_tensors", None),
+        )
+
+    def clone(self) -> _LLMGraphBufferBundle:
+        from vllm.v1.worker.gpu.input_batch import InputBuffers
+
+        return type(self)(
+            runner=self.runner,
+            input_buffers=InputBuffers(
+                max_num_reqs=self.input_buffers.max_num_reqs,
+                max_num_tokens=self.input_buffers.max_num_tokens,
+                device=self.input_buffers.device,
+            ),
+            # KV 分配及 staged-write 状态必须由两个变体共享；只复制 graph
+            # 捕获/重放直接读写的输出区域。
+            block_tables=self.block_tables,
+            block_table_buffers=self.block_table_buffers.clone(
+                self.block_tables
+            ),
+            intermediate_tensors=self.intermediate_tensors,
+        )
+
+    def activate(self) -> None:
+        self.runner.input_buffers = self.input_buffers
+        self.runner.block_tables = self.block_tables
+        self.block_table_buffers.activate(self.block_tables)
+        if hasattr(self.runner, "intermediate_tensors"):
+            self.runner.intermediate_tensors = self.intermediate_tensors
+
+    def data_ptrs(self) -> dict[str, int]:
+        """枚举 bundle 中 CUDA tensor 的地址，供真机 A/B 验证。"""
+        result: dict[str, int] = {}
+        seen: set[int] = set()
+
+        def visit(prefix: str, value: Any) -> None:
+            identity = id(value)
+            if identity in seen:
+                return
+            seen.add(identity)
+            data_ptr = getattr(value, "data_ptr", None)
+            if callable(data_ptr):
+                try:
+                    result[prefix] = int(data_ptr())
+                except (RuntimeError, TypeError):
+                    pass
+                return
+            if isinstance(value, dict):
+                for name, item in value.items():
+                    visit(f"{prefix}.{name}", item)
+                return
+            if isinstance(value, (tuple, list)):
+                for index, item in enumerate(value):
+                    visit(f"{prefix}[{index}]", item)
+                return
+            values = getattr(value, "__dict__", None)
+            if isinstance(values, dict):
+                for name, item in values.items():
+                    visit(f"{prefix}.{name}", item)
+
+        visit("input_buffers", self.input_buffers)
+        visit("block_table_buffers", self.block_table_buffers)
+        visit("intermediate_tensors", self.intermediate_tensors)
+        return result
+
+
 @dataclass(frozen=True)
 class _ResolvedOmniStage:
     """OmniModelExecUnit 创建 Runner 所需的配置视图。"""
@@ -188,9 +311,9 @@ class LLMExecUnit(ExecUnit[Any, Any]):
         self._worker: Any | None = None
         self._container: Any | None = None
         self._graph_manager: Any | None = None
-        # CUDA Graph 资源变体共享原生 Runner 的持久输入/输出状态。切换变体
-        # 时必须在同一处完成 graph 激活、旧 stream drain 和新 stream 绑定，
-        # 不能把这三步拆散到 Container/Binding 中。
+        # CUDA Graph 资源变体可共享或隔离 graph-facing 持久 buffer。无论
+        # 地址模式如何，切换时必须在同一处完成 graph/buffer 激活、旧 stream
+        # drain 和新 stream 绑定，不能拆散到 Container/Binding 中。
         self._active_graph_stream: Any | None = None
 
     def attach_native_runtime(
@@ -317,14 +440,24 @@ class LLMExecUnit(ExecUnit[Any, Any]):
                 assignment.graph is not None and resource_transition
             )
             if graph_transition:
-                # 保持旧 MultiModelGPUWorker 已验证过的原子切换顺序：
+                # ``host`` 保持旧 MultiModelGPUWorker 已验证过的原子切换顺序：
                 # 1. 先令原生 graph manager 指向目标 executable；
                 # 2. 排空旧 compute stream；
                 # 3. 排空异步 output-copy stream；
                 # 4. 最后才把 Runner 绑定到目标执行 stream。
+                # ``timeline`` 不做 host drain；MiniContainer 随后进入统一的
+                # ModelGPUTimeline.slice()，由目标 stream 等待上一 slice 的
+                # completion event。该 event 已覆盖 output-copy 尾部工作。
                 assignment.graph.activate(self.runner)
                 previous_stream = self._active_graph_stream
-                if previous_stream is not None:
+                sync_mode = "host"
+                container = self._container
+                if container is not None:
+                    description = container.resource_description
+                    if description is not None:
+                        sync_mode = description.graph_transition_sync_mode
+                if previous_stream is not None and sync_mode == "host":
+                    # 保留为安全回退路径。C15 的 timeline 实验不删除它。
                     previous_stream.synchronize()
                     synchronized: set[int] = set()
                     for name in (
@@ -431,10 +564,52 @@ class LLMExecUnit(ExecUnit[Any, Any]):
         **kwargs: Any,
     ) -> int:
         _, container, graph_manager = self._native_runtime()
+        buffer_mode = container.resource_description.graph_buffer_mode
+        native = runner.cudagraph_manager
+        configure_outputs = getattr(
+            native,
+            "configure_resource_variant_output_isolation",
+            None,
+        )
+        if configure_outputs is None:
+            if buffer_mode == "isolated":
+                raise RuntimeError(
+                    "Native CUDA Graph manager cannot isolate variant outputs"
+                )
+        else:
+            configure_outputs(buffer_mode == "isolated")
+        shared_buffers = _LLMGraphBufferBundle.current(runner)
+        if buffer_mode == "isolated":
+            unsupported = [
+                name
+                for name, enabled in (
+                    ("PCP", getattr(runner, "pcp_manager", None) is not None),
+                    (
+                        "speculative decoding",
+                        getattr(runner, "speculator", None) is not None,
+                    ),
+                    (
+                        "adaptive verification",
+                        getattr(runner, "adaptive_verification", None)
+                        is not None,
+                    ),
+                    (
+                        "pipeline parallelism",
+                        bool(getattr(runner, "use_pp", False)),
+                    ),
+                )
+                if enabled
+            ]
+            if unsupported:
+                raise RuntimeError(
+                    "Isolated graph buffers do not yet support: "
+                    + ", ".join(unsupported)
+                )
 
         def capture_with_stream_patch(
             variant_name: str,
             capture: Any,
+            buffer_bundle: _LLMGraphBufferBundle,
             **capture_kwargs: Any,
         ) -> int:
             from vllm.experimental.runtime_stream_patch import (
@@ -452,15 +627,26 @@ class LLMExecUnit(ExecUnit[Any, Any]):
             patch = install_vllm_graph_capture_stream_patch(stream)
             try:
                 return container.capture_graph_variant(
-                    variant_name, capture, **capture_kwargs
+                    variant_name,
+                    capture,
+                    buffer_bundle=buffer_bundle,
+                    **capture_kwargs,
                 )
             finally:
                 patch.restore()
 
-        total = capture_with_stream_patch("shared", capture_shared, **kwargs)
+        total = capture_with_stream_patch(
+            "shared", capture_shared, shared_buffers, **kwargs
+        )
+        full_buffers = (
+            shared_buffers.clone()
+            if buffer_mode == "isolated"
+            else shared_buffers
+        )
         total += capture_with_stream_patch(
             "reasoner_full",
             lambda: self._capture_additional_graph(runner),
+            full_buffers,
         )
         default_variant = container.resource_description.default_variant
         if default_variant is None:

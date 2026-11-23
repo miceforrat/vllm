@@ -671,6 +671,7 @@ class _GraphModelSlot:
     
     native_manager: Any
     variants: dict[GraphVariantKey, CudaStreamBinding]
+    buffer_bundles: dict[GraphVariantKey, Any]
     runner_id: int | None = None
     capture_handler: Callable[..., int] | None = None
 
@@ -683,8 +684,9 @@ class GCCudaGraphManager:
     构造 native manager。实现内部的完整 executable key 应为
     ``(GraphVariantKey, BatchExecutionDescriptor)``。
 
-    多个变体共享原生 manager 的持久输入/输出 buffer；切换安全性由执行边界
-    的 compute/output-copy 双 drain 保证。
+    多个变体可以共享持久 buffer，也可以登记各自的 buffer bundle。后一种
+    模式在激活 executable 时同时切换 graph-facing 地址；切换安全性仍由执行
+    边界的 compute/output-copy drain 保证，地址隔离本身不替代因果同步。
     """
 
     def __init__(self) -> None:
@@ -719,7 +721,7 @@ class GCCudaGraphManager:
                     "One native CUDA Graph manager cannot be registered by "
                     f"both {previous_owner!r} and {owner!r}"
                 )
-            self._models[owner] = _GraphModelSlot(native_manager, {})
+            self._models[owner] = _GraphModelSlot(native_manager, {}, {})
             self._native_owners[native_id] = owner
 
     def set_capture_handler(
@@ -771,6 +773,8 @@ class GCCudaGraphManager:
         key: GraphVariantKey,
         stream: CudaStreamBinding,
         capture_native: Callable[..., int],
+        *,
+        buffer_bundle: Any | None = None,
         **kwargs: Any,
     ) -> int:
         """在指定资源 stream 上调用原生 capture 路径捕获一种变体。"""
@@ -778,6 +782,8 @@ class GCCudaGraphManager:
             slot = self._require_model(key.owner_id)
             if key in slot.variants:
                 raise ValueError(f"CUDA Graph variant {key!r} already exists")
+            if buffer_bundle is not None:
+                buffer_bundle.activate()
             slot.native_manager.activate_resource_variant(key)
             try:
                 with stream.execution_context():
@@ -786,6 +792,8 @@ class GCCudaGraphManager:
                 slot.native_manager.clear_resource_variant(key)
                 raise
             slot.variants[key] = stream
+            if buffer_bundle is not None:
+                slot.buffer_bundles[key] = buffer_bundle
             return captured_bytes
 
     def binding(self, key: GraphVariantKey) -> GraphBinding:
@@ -815,7 +823,29 @@ class GCCudaGraphManager:
                     "manager"
                 )
             runner.cudagraph_manager = slot.native_manager
+            bundle = slot.buffer_bundles.get(key)
+            if bundle is not None:
+                bundle.activate()
             slot.native_manager.activate_resource_variant(key)
+
+    def buffer_pointers(
+        self, owner_id: str
+    ) -> dict[str, dict[str, int]]:
+        """返回各 graph variant 的持久 buffer 地址，用于验证隔离。"""
+        with self._lock:
+            slot = self._require_model(owner_id)
+            result: dict[str, dict[str, int]] = {}
+            output_pointers = getattr(
+                slot.native_manager,
+                "resource_variant_output_pointers",
+                None,
+            )
+            for key, bundle in slot.buffer_bundles.items():
+                pointers = dict(bundle.data_ptrs())
+                if output_pointers is not None:
+                    pointers.update(output_pointers(key))
+                result[key.variant_name] = pointers
+            return result
 
     def has_variant(self, key: GraphVariantKey) -> bool:
         with self._lock:
@@ -877,6 +907,7 @@ class GCCudaGraphManager:
             slot = self._require_model(owner)
             for key in tuple(slot.variants):
                 slot.native_manager.clear_resource_variant(key)
+            slot.buffer_bundles.clear()
             del self._native_owners[id(slot.native_manager)]
             del self._models[owner]
 

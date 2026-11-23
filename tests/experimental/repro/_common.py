@@ -41,6 +41,18 @@ def base_parser(description: str) -> argparse.ArgumentParser:
     p.add_argument("--model", required=True, help="Cosmos3-Edge 路径（与 smoke 的 --model 相同）")
     p.add_argument("--model-id", default="generator")
     p.add_argument("--reasoner-mode", choices=("eager", "graph"), default="graph")
+    p.add_argument(
+        "--reasoner-graph-buffer-mode",
+        choices=("shared", "isolated"),
+        default="shared",
+        help="Reasoner CUDA Graph 资源变体的持久 buffer 地址策略",
+    )
+    p.add_argument(
+        "--reasoner-graph-transition-sync-mode",
+        choices=("host", "timeline", "variant_output"),
+        default="host",
+        help="Reasoner Graph 变体切换使用 host drain 或 GPU timeline",
+    )
     p.add_argument("--generator-cache", choices=("none", "sea_cache"), default="none",
                    help="默认关闭 SeaCache，保证每次计算量相同、结果可比")
     p.add_argument("--reasoner-sm-count", type=int, default=34)

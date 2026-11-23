@@ -68,6 +68,7 @@ class MiniContainer:
         self._closed = False
         self._lock = threading.RLock()
 
+
     @classmethod
     def acquire(
         cls,
@@ -241,6 +242,8 @@ class MiniContainer:
         self,
         variant_name: str,
         capture_native: Any,
+        *,
+        buffer_bundle: Any | None = None,
         **kwargs: Any,
     ) -> int:
         """通过统一 Graph Manager 捕获并接入一个声明过的资源变体。"""
@@ -257,7 +260,11 @@ class MiniContainer:
             assignment = self._assignments[variant.name]
             key = GraphVariantKey(self.model_id, variant.name)
             captured = self._graph_manager.capture_variant(
-                key, assignment.streams, capture_native, **kwargs
+                key,
+                assignment.streams,
+                capture_native,
+                buffer_bundle=buffer_bundle,
+                **kwargs,
             )
             self._assignments[variant.name] = replace(
                 assignment,
@@ -315,6 +322,7 @@ class MiniContainer:
                 selected_name,
                 require_graph=self._require_graph,
             )
+            name = "default" if selected_name is None else selected_name
             resource_transition = selected is not self._active_assignment
             timeline_span = None
             try:
@@ -325,6 +333,7 @@ class MiniContainer:
                     with self._timeline.slice(
                         execution_stream,
                         dependent_streams=self._dependent_streams(),
+                        independent_tail_key=self._independent_tail_key(name),
                     ) as timeline_span: # 统一使用timeline.slice
                         result = self._exec_unit.execute_slice(
                             selected_descriptor,
@@ -332,7 +341,6 @@ class MiniContainer:
                         )
             except Exception as exc:
                 self._active_assignment = selected
-                name = "default" if selected_name is None else selected_name
                 self._variant_step_counts[name] += 1
                 if timeline_span is not None:
                     self._record_slice(
@@ -346,7 +354,6 @@ class MiniContainer:
                     )
                 raise
             self._active_assignment = selected
-            name = "default" if selected_name is None else selected_name
             self._variant_step_counts[name] += 1
             self._record_slice(
                 selected_descriptor,
@@ -381,6 +388,9 @@ class MiniContainer:
                 with self._timeline.slice(
                     execution_stream,
                     dependent_streams=self._dependent_streams(),
+                    independent_tail_key=self._independent_tail_key(
+                        self._active_variant_name()
+                    ),
                 ) as continuation:
                     output = operation()
             # sampling 是上一 scheduler slice 的后半段，不另造一条记录；把
@@ -403,6 +413,22 @@ class MiniContainer:
             for name in ("output_copy_stream", "async_output_copy_stream")
             if (stream := getattr(runner, name, None)) is not None
         )
+
+    def _active_variant_name(self) -> str:
+        selected = self._active_assignment
+        for name, assignment in self._assignments.items():
+            if assignment is selected:
+                return name
+        return "default"
+
+    def _independent_tail_key(self, variant_name: str) -> str | None:
+        description = self._description
+        if (
+            description is None
+            or description.graph_transition_sync_mode != "variant_output"
+        ):
+            return None
+        return variant_name
 
     def variant_step_counts(self) -> dict[str, int]:
         """返回该模型各资源变体的实际执行次数。"""

@@ -16,6 +16,8 @@ from vllm.experimental.communication import CommunicationGroupDescription
 
 StreamKind = Literal["default", "dedicated", "green_context"]
 MemoryKind = Literal["default", "tagged_pool"]
+GraphBufferMode = Literal["shared", "isolated"]
+GraphTransitionSyncMode = Literal["host", "timeline", "variant_output"]
 
 
 @dataclass(frozen=True)
@@ -124,8 +126,31 @@ class ResourceDescription:
     )
     execution_variants: tuple[ExecutionVariantDescription, ...] = ()
     default_variant: str | None = None
+    graph_buffer_mode: GraphBufferMode = "shared"
+    graph_transition_sync_mode: GraphTransitionSyncMode = "host"
 
     def __post_init__(self) -> None:
+        if self.graph_buffer_mode not in {"shared", "isolated"}:
+            raise ValueError(
+                "graph_buffer_mode must be 'shared' or 'isolated'"
+            )
+        if self.graph_transition_sync_mode not in {
+            "host",
+            "timeline",
+            "variant_output",
+        }:
+            raise ValueError(
+                "graph_transition_sync_mode must be 'host', 'timeline', or "
+                "'variant_output'"
+            )
+        if (
+            self.graph_transition_sync_mode in {"timeline", "variant_output"}
+            and self.graph_buffer_mode != "isolated"
+        ):
+            raise ValueError(
+                "timeline/variant_output graph transitions require isolated "
+                "graph buffers"
+            )
         normalized_groups = tuple(
             CommunicationGroupDescription.from_rpc_payload(group)
             for group in self.communication_groups
